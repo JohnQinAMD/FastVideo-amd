@@ -78,6 +78,8 @@ _triton_attn = _import_from_file(
     os.path.join(_pkg_dir, "triton_kernels", "block_sparse_attn_triton.py"))
 triton_block_sparse_attn_forward = _triton_attn.triton_block_sparse_attn_forward
 
+map_to_index_and_delta = _triton_index.map_to_index_and_delta
+
 BLOCK = 64
 
 
@@ -433,12 +435,292 @@ def run_benchmarks() -> List[BenchResult]:
     return results
 
 
+# ─────────────────── Optimized Pipeline Benchmark ─────────────────────────
+
+def run_opt_benchmarks() -> List[BenchResult]:
+    """Benchmark the optimized CK path: fused delta + skip VBS correction."""
+    from triton.testing import do_bench
+
+    print()
+    print("=" * 100)
+    print("OPTIMIZED PATH: fused delta LUT + skip VBS correction")
+    print("=" * 100)
+    print()
+
+    bench_configs = [
+        (1, 12, 4096, 128, 4096, 6),
+        (1, 12, 8192, 128, 8192, 12),
+        (1, 12, 16384, 128, 16384, 25),
+        (1, 12, 32768, 128, 32768, 51),
+        (1, 12, 49152, 128, 49152, 76),
+        (1, 12, 65536, 128, 65536, 102),
+        # D=64
+        (1, 12, 4096, 64, 4096, 6),
+        (1, 12, 16384, 64, 16384, 25),
+        (1, 12, 49152, 64, 49152, 76),
+    ]
+
+    hdr = (f"{'Sq':>6} {'D':>3} {'topk':>5} {'Triton ms':>10} "
+           f"{'CK base':>10} {'CK opt':>10} {'opt/base':>10} {'opt vs Tri':>10}")
+    print(hdr)
+    print("-" * len(hdr))
+
+    results = []
+    for B, H, Sq, D, Sk, topk in bench_configs:
+        q, k, v, bm, q2k_idx, q2k_num, vbs = make_inputs(B, H, Sq, D, Sk, topk)
+        nkv = Sk // BLOCK
+        density = topk / nkv * 100
+
+        # Pre-compute fused delta LUT (done once, outside timed region)
+        q2k_idx_fused, q2k_delta, q2k_num_fused = map_to_index_and_delta(bm)
+
+        # Triton baseline
+        ms_tri = do_bench(
+            lambda: triton_block_sparse_attn_forward(q, k, v, q2k_idx, q2k_num, vbs),
+            warmup=5, rep=30)
+
+        # CK baseline (no delta, with VBS correction)
+        ms_ck_base = do_bench(
+            lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
+                q, k, v, q2k_idx, q2k_num, vbs, 64),
+            warmup=5, rep=30)
+
+        # CK optimized (fused delta + skip VBS)
+        ms_ck_opt = do_bench(
+            lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
+                q, k, v, q2k_idx_fused, q2k_num_fused, vbs, 64,
+                q2k_delta, True),
+            warmup=5, rep=30)
+
+        opt_vs_base = ms_ck_base / ms_ck_opt
+        opt_vs_tri = ms_tri / ms_ck_opt
+
+        print(f"{Sq:6d} {D:3d} {topk:5d} {ms_tri:10.3f} "
+              f"{ms_ck_base:10.3f} {ms_ck_opt:10.3f} {opt_vs_base:9.2f}x {opt_vs_tri:9.2f}x")
+
+        fl = flops_sparse(B, H, D, Sq, topk)
+        ck_tflops = fl / ms_ck_opt * 1e-12 * 1e3
+        results.append(BenchResult(
+            config=f"opt Sq={Sq},D={D},topk={topk}",
+            Sq=Sq, Sk=Sk, topk=topk, density_pct=round(density, 1),
+            triton_ms=round(ms_tri, 3), ck_ms=round(ms_ck_opt, 3),
+            speedup=round(opt_vs_tri, 2), ck_tflops=round(ck_tflops, 1)))
+
+    return results
+
+
+# ─────────────── block_m=128 Tile Benchmark ──────────────────────────────
+
+def run_blockm128_benchmarks():
+    """Benchmark CK kM0=128 tile vs kM0=64 (same ~10% density, 64-token KV blocks)."""
+    from triton.testing import do_bench
+
+    BLOCK_KV = 64  # KV block granularity (kN0=64, always)
+
+    print()
+    print("=" * 100)
+    print("BLOCK_M=128 TILE: CK kM0=128 vs kM0=64 (same 10% density, optimized path)")
+    print("=" * 100)
+    print(f"Device: {torch.cuda.get_device_name(0)}")
+    print("Note: block_m=128 processes 128 Q tokens per tile (4 warps) vs 64 (2 warps).")
+    print("      Same topk KV blocks per Q tile → 2× better K/V reuse per Q token.")
+    print()
+
+    # Quick correctness sanity check at small Sq
+    print("--- Correctness sanity check (block_m=128) ---")
+    for Sq_test in [256, 1024, 4096]:
+        B, H, D = 1, 4, 128
+        Sk_test = Sq_test
+        nkv = Sk_test // BLOCK_KV
+        nq_128 = Sq_test // 128
+        topk = max(1, int(nkv * 0.10))
+
+        torch.manual_seed(42)
+        q = torch.randn(B, H, Sq_test, D, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(B, H, Sk_test, D, dtype=torch.bfloat16, device="cuda")
+        v = torch.randn(B, H, Sk_test, D, dtype=torch.bfloat16, device="cuda")
+
+        scores = torch.rand(B, H, nq_128, nkv, device="cuda")
+        idx = torch.topk(scores, topk, dim=-1).indices
+        bm_128 = torch.zeros(B, H, nq_128, nkv, dtype=torch.bool, device="cuda")
+        bm_128.scatter_(-1, idx, True)
+        q2k_idx, q2k_delta, q2k_num = map_to_index_and_delta(bm_128)
+        vbs = torch.full((nkv,), BLOCK_KV, dtype=torch.int32, device="cuda")
+
+        o_ck, _ = ck_vsa_ops.ck_block_sparse_attn_fwd(
+            q, k, v, q2k_idx, q2k_num, vbs, 128, q2k_delta, True)
+        torch.cuda.synchronize()
+
+        # PyTorch fp32 reference
+        full_mask = torch.zeros(B, H, Sq_test, Sk_test, dtype=torch.bool, device=q.device)
+        for b in range(B):
+            for h in range(H):
+                for qi in range(nq_128):
+                    for ki in range(nkv):
+                        if bm_128[b, h, qi, ki]:
+                            full_mask[b, h, qi*128:(qi+1)*128, ki*64:(ki+1)*64] = True
+        q_f, k_f, v_f = q.float(), k.float(), v.float()
+        scale = 1.0 / math.sqrt(D)
+        qk = torch.matmul(q_f, k_f.transpose(-2, -1)) * scale
+        qk = qk.masked_fill(~full_mask, float('-inf'))
+        attn = torch.nn.functional.softmax(qk, dim=-1)
+        attn = attn.masked_fill(torch.isnan(attn), 0.0)
+        ref = torch.matmul(attn, v_f)
+
+        cos = torch.nn.functional.cosine_similarity(
+            ref.float().flatten().unsqueeze(0),
+            o_ck.float().flatten().unsqueeze(0)).item()
+        status = "OK" if cos >= 0.9999 else "FAIL"
+        print(f"  [{status}] Sq={Sq_test:5d}  nq_128={nq_128:3d}  topk={topk:3d}  "
+              f"cos_sim={cos:.6f}")
+
+    print()
+
+    # Performance benchmark
+    bench_configs = [
+        # (B, H, Sq, D, Sk)
+        (1, 12, 4096, 128, 4096),
+        (1, 12, 8192, 128, 8192),
+        (1, 12, 16384, 128, 16384),
+        (1, 12, 32768, 128, 32768),
+        (1, 12, 49152, 128, 49152),
+        (1, 12, 65536, 128, 65536),
+    ]
+
+    hdr = (f"{'Sq':>6} {'topk':>5} {'Triton m64':>11} "
+           f"{'CK m=64':>10} {'CK m=128':>10} {'m128/m64':>9} {'m128 vs Tri':>12}")
+    print(hdr)
+    print("-" * len(hdr))
+
+    results = []
+    for B, H, Sq, D, Sk in bench_configs:
+        nkv = Sk // BLOCK_KV
+        topk = max(1, int(nkv * 0.10))
+
+        torch.manual_seed(42)
+        q = torch.randn(B, H, Sq, D, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(B, H, Sk, D, dtype=torch.bfloat16, device="cuda")
+        v = torch.randn(B, H, Sk, D, dtype=torch.bfloat16, device="cuda")
+        vbs = torch.full((nkv,), BLOCK_KV, dtype=torch.int32, device="cuda")
+
+        # --- block_m=64 inputs ---
+        nq_64 = Sq // 64
+        scores_64 = torch.rand(B, H, nq_64, nkv, device="cuda")
+        idx_64 = torch.topk(scores_64, topk, dim=-1).indices
+        bm_64 = torch.zeros(B, H, nq_64, nkv, dtype=torch.bool, device="cuda")
+        bm_64.scatter_(-1, idx_64, True)
+        q2k_idx_64, q2k_delta_64, q2k_num_64 = map_to_index_and_delta(bm_64)
+
+        # Also build old-style index for Triton
+        q2k_idx_64_abs, q2k_num_64_abs = _map_to_index(bm_64)
+
+        # --- block_m=128 inputs (same density, 128-token Q blocks) ---
+        nq_128 = Sq // 128
+        scores_128 = torch.rand(B, H, nq_128, nkv, device="cuda")
+        idx_128 = torch.topk(scores_128, topk, dim=-1).indices
+        bm_128 = torch.zeros(B, H, nq_128, nkv, dtype=torch.bool, device="cuda")
+        bm_128.scatter_(-1, idx_128, True)
+        q2k_idx_128, q2k_delta_128, q2k_num_128 = map_to_index_and_delta(bm_128)
+
+        # Triton baseline (block_m=64 only)
+        ms_tri = do_bench(
+            lambda: triton_block_sparse_attn_forward(
+                q, k, v, q2k_idx_64_abs, q2k_num_64_abs, vbs),
+            warmup=5, rep=30)
+
+        # CK block_m=64 optimized
+        ms_ck64 = do_bench(
+            lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
+                q, k, v, q2k_idx_64, q2k_num_64, vbs, 64,
+                q2k_delta_64, True),
+            warmup=5, rep=30)
+
+        # CK block_m=128 optimized
+        ms_ck128 = do_bench(
+            lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
+                q, k, v, q2k_idx_128, q2k_num_128, vbs, 128,
+                q2k_delta_128, True),
+            warmup=5, rep=30)
+
+        sp_128v64 = ms_ck64 / ms_ck128
+        sp_128vtri = ms_tri / ms_ck128
+
+        print(f"{Sq:6d} {topk:5d} {ms_tri:11.3f} "
+              f"{ms_ck64:10.3f} {ms_ck128:10.3f} {sp_128v64:8.2f}x {sp_128vtri:11.2f}x")
+
+        fl = flops_sparse(B, H, D, Sq, topk)
+        results.append({
+            "Sq": Sq, "topk": topk,
+            "triton_ms": round(ms_tri, 3),
+            "ck_m64_ms": round(ms_ck64, 3),
+            "ck_m128_ms": round(ms_ck128, 3),
+            "m128_vs_m64": round(sp_128v64, 2),
+            "m128_vs_triton": round(sp_128vtri, 2),
+        })
+
+    # Also benchmark the "merged" scenario: same 64-granularity pattern, merged to 128
+    print()
+    print("--- Merged pattern: 64-granularity block map → merged to 128-granularity ---")
+    print("Note: union of adjacent Q-block rows increases effective topk per Q tile.")
+    print()
+    hdr2 = (f"{'Sq':>6} {'topk64':>7} {'topk128':>8} "
+            f"{'CK m=64':>10} {'CK m=128':>10} {'speedup':>8}")
+    print(hdr2)
+    print("-" * len(hdr2))
+
+    for B, H, Sq, D, Sk in bench_configs:
+        nkv = Sk // BLOCK_KV
+        topk = max(1, int(nkv * 0.10))
+        nq_64 = Sq // 64
+        nq_128 = Sq // 128
+
+        torch.manual_seed(42)
+        q = torch.randn(B, H, Sq, D, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(B, H, Sk, D, dtype=torch.bfloat16, device="cuda")
+        v = torch.randn(B, H, Sk, D, dtype=torch.bfloat16, device="cuda")
+        vbs = torch.full((nkv,), BLOCK_KV, dtype=torch.int32, device="cuda")
+
+        # Build 64-granularity block map
+        scores_64 = torch.rand(B, H, nq_64, nkv, device="cuda")
+        idx_64 = torch.topk(scores_64, topk, dim=-1).indices
+        bm_64 = torch.zeros(B, H, nq_64, nkv, dtype=torch.bool, device="cuda")
+        bm_64.scatter_(-1, idx_64, True)
+        q2k_idx_64, q2k_delta_64, q2k_num_64 = map_to_index_and_delta(bm_64)
+
+        # Merge to 128-granularity: union adjacent Q-block rows
+        bm_merged = bm_64[:, :, 0::2, :] | bm_64[:, :, 1::2, :]
+        q2k_idx_m, q2k_delta_m, q2k_num_m = map_to_index_and_delta(bm_merged)
+        avg_topk_128 = q2k_num_m.float().mean().item()
+
+        # CK block_m=64 optimized
+        ms_ck64 = do_bench(
+            lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
+                q, k, v, q2k_idx_64, q2k_num_64, vbs, 64,
+                q2k_delta_64, True),
+            warmup=5, rep=30)
+
+        # CK block_m=128 (merged pattern)
+        ms_ck128 = do_bench(
+            lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
+                q, k, v, q2k_idx_m, q2k_num_m, vbs, 128,
+                q2k_delta_m, True),
+            warmup=5, rep=30)
+
+        sp = ms_ck64 / ms_ck128
+        print(f"{Sq:6d} {topk:7d} {avg_topk_128:7.0f} "
+              f"{ms_ck64:10.3f} {ms_ck128:10.3f} {sp:7.2f}x")
+
+    return results
+
+
 # ─────────────────────────── Main ──────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--bench-only", action="store_true")
+    parser.add_argument("--blockm128", action="store_true",
+                        help="Run block_m=128 tile benchmark only")
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
@@ -450,6 +732,10 @@ def main():
     correctness_results = []
     bench_results = []
 
+    if args.blockm128:
+        run_blockm128_benchmarks()
+        return
+
     if not args.bench_only:
         correctness_results = run_correctness_tests()
         n_pass = sum(1 for r in correctness_results if r.passed)
@@ -460,12 +746,15 @@ def main():
                 if not r.passed:
                     print(f"  FAIL: {r.config} — {r.note}")
 
+    opt_results = []
     if not args.quick:
         bench_results = run_benchmarks()
         if bench_results:
             speedups = [r.speedup for r in bench_results]
             print(f"\nBENCHMARK SUMMARY: {min(speedups):.2f}x – {max(speedups):.2f}x "
                   f"(avg {sum(speedups)/len(speedups):.2f}x)")
+
+        opt_results = run_opt_benchmarks()
 
     if args.output:
         out = {
@@ -474,6 +763,7 @@ def main():
             "block_size": BLOCK,
             "correctness": [asdict(r) for r in correctness_results],
             "benchmarks": [asdict(r) for r in bench_results],
+            "optimized_benchmarks": [asdict(r) for r in opt_results],
         }
         with open(args.output, "w") as f:
             json.dump(out, f, indent=2)

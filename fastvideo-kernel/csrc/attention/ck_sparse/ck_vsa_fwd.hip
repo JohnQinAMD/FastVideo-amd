@@ -66,14 +66,15 @@ __global__ void vbs_lse_correction_kernel(
     const int32_t* __restrict__ vbs,         // [num_kv_blocks]
     int Q_blks,
     int max_kv_blks,
-    int BLOCK,
+    int block_q,
+    int block_kv,
     int D,
     int total_q_tokens)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= total_q_tokens) return;
 
-    int q_blk = tid / BLOCK;
+    int q_blk = tid / block_q;
     int n = q2k_num[q_blk];
     const int32_t* idx_row = q2k_idx + static_cast<int64_t>(q_blk) * max_kv_blks;
 
@@ -82,7 +83,7 @@ __global__ void vbs_lse_correction_kernel(
     for (int i = 0; i < n; ++i) {
         int kv_blk = idx_row[i];
         int bs = vbs[kv_blk];
-        pad_count += (BLOCK - bs);
+        pad_count += (block_kv - bs);
     }
 
     if (pad_count == 0) return;  // all blocks full, no correction needed
@@ -121,20 +122,21 @@ __global__ void vbs_output_correction_kernel(
     const int32_t* __restrict__ q2k_num,
     const int32_t* __restrict__ vbs,
     int max_kv_blks,
-    int BLOCK,
+    int block_q,
+    int block_kv,
     int D,
     int total_q_tokens)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= total_q_tokens) return;
 
-    int q_blk = tid / BLOCK;
+    int q_blk = tid / block_q;
     int n = q2k_num[q_blk];
     const int32_t* idx_row = q2k_idx + static_cast<int64_t>(q_blk) * max_kv_blks;
 
     int pad_count = 0;
     for (int i = 0; i < n; ++i) {
-        pad_count += (BLOCK - vbs[idx_row[i]]);
+        pad_count += (block_kv - vbs[idx_row[i]]);
     }
     if (pad_count == 0) return;
 
@@ -166,19 +168,25 @@ ck_block_sparse_attn_fwd(
     torch::Tensor q2k_index,            // [B, H, Q_blks, max_kv_blks]  int32 absolute
     torch::Tensor q2k_num,              // [B, H, Q_blks]               int32 counts
     torch::Tensor variable_block_sizes, // [num_kv_blocks]               int32 (tokens per KV block)
-    int block_m)                        // 64 — CK tile selection
+    int block_m,                        // 64 — CK tile selection
+    c10::optional<torch::Tensor> q2k_delta_opt = c10::nullopt,
+                                        // [B, H, Q_blks, max_kv_blks] int32 delta LUT; when
+                                        // provided (e.g. from the fused triton producer), the
+                                        // abs→delta launch here is skipped.
+    bool skip_vbs_correction = false)   // when true, skip the VBS output correction kernel
+                                        // entirely (safe when all block sizes == 64).
 {
     TORCH_CHECK(q.is_cuda(), "q must be CUDA");
     TORCH_CHECK(q.dim() == 4, "q must be [B,H,Sq,D]");
     TORCH_CHECK(q.scalar_type() == at::kBFloat16 || q.scalar_type() == at::kHalf,
                 "q must be bf16 or fp16");
-
-    q = q.contiguous();
-    k = k.contiguous();
-    v = v.contiguous();
-    q2k_index = q2k_index.contiguous();
-    q2k_num   = q2k_num.contiguous();
-    variable_block_sizes = variable_block_sizes.contiguous();
+    TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
+    TORCH_CHECK(k.is_contiguous(), "k must be contiguous");
+    TORCH_CHECK(v.is_contiguous(), "v must be contiguous");
+    TORCH_CHECK(q2k_index.is_contiguous(), "q2k_index must be contiguous");
+    TORCH_CHECK(q2k_num.is_contiguous(), "q2k_num must be contiguous");
+    TORCH_CHECK(variable_block_sizes.is_contiguous(),
+                "variable_block_sizes must be contiguous");
 
     const int B  = q.size(0);
     const int H  = q.size(1);
@@ -186,17 +194,24 @@ ck_block_sparse_attn_fwd(
     const int D  = q.size(3);
     const int Sk = k.size(2);
     const int max_kv_blks = q2k_index.size(-1);
-    const int BLOCK = 64;
+    const int BLOCK_KV = 64;
+    const int Q_blks = q2k_index.size(2);
 
     auto o   = torch::empty_like(q);
     auto lse = torch::empty({B, H, Sq}, q.options().dtype(at::kFloat));
 
     hipStream_t stream = nullptr;
 
-    // --- Convert absolute indices to delta LUT ---
-    auto delta_lut = torch::empty_like(q2k_index);
-    {
-        int total_rows = B * H * (Sq / BLOCK);
+    // --- Delta LUT (for CK pipeline) ---
+    torch::Tensor delta_lut;
+    if (q2k_delta_opt.has_value()) {
+        delta_lut = *q2k_delta_opt;
+        TORCH_CHECK(delta_lut.is_contiguous(), "q2k_delta must be contiguous");
+        TORCH_CHECK(delta_lut.sizes() == q2k_index.sizes(),
+                    "q2k_delta must have the same shape as q2k_index");
+    } else {
+        delta_lut = torch::empty_like(q2k_index);
+        int total_rows = B * H * Q_blks;
         int threads = 256;
         int blocks  = (total_rows + threads - 1) / threads;
         abs_to_delta_kernel<<<blocks, threads, 0, stream>>>(
@@ -258,17 +273,10 @@ ck_block_sparse_attn_fwd(
                           " block_m=" + std::to_string(block_m));
 
     // --- Variable block size correction ---
-    // Check if any block has < BLOCK tokens.
-    bool needs_vbs_correction = false;
-    {
-        auto vbs_cpu = variable_block_sizes.cpu();
-        auto* p = vbs_cpu.data_ptr<int32_t>();
-        for (int i = 0; i < vbs_cpu.numel(); ++i) {
-            if (p[i] < BLOCK) { needs_vbs_correction = true; break; }
-        }
-    }
-
-    if (needs_vbs_correction) {
+    // When all KV blocks are full (block_size == 64), no correction is
+    // needed. The caller can signal this via skip_vbs_correction=true to
+    // eliminate the kernel launch overhead (~5 µs).
+    if (!skip_vbs_correction) {
         int total_q_tokens = B * H * Sq;
         int threads = 256;
         int blocks  = (total_q_tokens + threads - 1) / threads;
@@ -280,7 +288,7 @@ ck_block_sparse_attn_fwd(
                 q2k_index.data_ptr<int32_t>(),
                 q2k_num.data_ptr<int32_t>(),
                 variable_block_sizes.data_ptr<int32_t>(),
-                max_kv_blks, BLOCK, D, total_q_tokens);
+                max_kv_blks, block_m, BLOCK_KV, D, total_q_tokens);
         } else {
             vbs_output_correction_kernel<__half><<<blocks, threads, 0, stream>>>(
                 reinterpret_cast<__half*>(o.data_ptr()),
@@ -289,7 +297,7 @@ ck_block_sparse_attn_fwd(
                 q2k_index.data_ptr<int32_t>(),
                 q2k_num.data_ptr<int32_t>(),
                 variable_block_sizes.data_ptr<int32_t>(),
-                max_kv_blks, BLOCK, D, total_q_tokens);
+                max_kv_blks, block_m, BLOCK_KV, D, total_q_tokens);
         }
     }
 
@@ -302,5 +310,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q"), py::arg("k"), py::arg("v"),
           py::arg("q2k_index"), py::arg("q2k_num"),
           py::arg("variable_block_sizes"),
-          py::arg("block_m") = 64);
+          py::arg("block_m") = 64,
+          py::arg("q2k_delta") = c10::nullopt,
+          py::arg("skip_vbs_correction") = false);
 }

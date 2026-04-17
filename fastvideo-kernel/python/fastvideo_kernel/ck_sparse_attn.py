@@ -54,6 +54,8 @@ def ck_block_sparse_attn_fwd(
     q2k_num: torch.Tensor,
     variable_block_sizes: torch.Tensor,
     block_m: int = 64,
+    q2k_delta: Optional[torch.Tensor] = None,
+    skip_vbs_correction: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     CK-tile block-sparse attention forward.
@@ -66,11 +68,17 @@ def ck_block_sparse_attn_fwd(
         q2k_num:   [B, H, Q_blocks] int32 valid block counts
         variable_block_sizes: [num_kv_blocks] int32 — tokens per KV block (1..64)
         block_m:   CK tile M dimension (64)
+        q2k_delta: [B, H, Q_blocks, max_kv_blks] int32 delta-encoded LUT.
+                   When provided (e.g. from map_to_index_and_delta), the
+                   HIP abs→delta kernel is skipped, saving one launch.
+        skip_vbs_correction: When True, skip the VBS output correction
+                   kernel entirely. Safe when all block sizes == 64.
 
     Returns:
         (output, lse): output [B,H,Sq,D] same dtype as q; lse [B,H,Sq] fp32
     """
     mod = _load_ck_extension()
     return mod.ck_block_sparse_attn_fwd(
-        q, k, v, q2k_index, q2k_num, variable_block_sizes, block_m
+        q, k, v, q2k_index, q2k_num, variable_block_sizes, block_m,
+        q2k_delta, skip_vbs_correction
     )

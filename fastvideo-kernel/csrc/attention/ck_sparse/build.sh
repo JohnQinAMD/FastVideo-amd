@@ -37,6 +37,7 @@ echo "CK_DIR=${CK_DIR}"
 # CK sparse attn example dir (contains fmha_fwd_trek.hpp, codegen/, mask.hpp ref).
 CK_SPARSE_DIR="${CK_DIR}/example/ck_tile/50_sparse_attn"
 CK_FMHA_DIR="${CK_DIR}/example/ck_tile/01_fmha"
+CK_EXAMPLE_DIR="${CK_DIR}/example/ck_tile"
 
 # --- GPU arch ---
 if [ -z "${GPU_ARCH}" ]; then
@@ -83,6 +84,7 @@ COMMON_FLAGS=(
     -I"${CK_DIR}/include/ck_tile/ops/sparse_attn"
     -I"${CK_SPARSE_DIR}"
     -I"${CK_FMHA_DIR}"
+    -I"${CK_EXAMPLE_DIR}"
     -I"${PYTHON_INC}"
     ${TORCH_INC}
 )
