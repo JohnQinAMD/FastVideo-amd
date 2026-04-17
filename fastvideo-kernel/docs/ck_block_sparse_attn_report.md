@@ -196,14 +196,14 @@ output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
 
 ## 4. Current Scope
 
-| Feature | Status |
-|---------|--------|
-| Forward pass (bf16) | Supported |
-| Forward pass (fp16) | Supported by CK |
-| Backward pass | Not yet integrated |
-| Symmetric Q/KV lengths | Supported |
-| Asymmetric Q/KV lengths | Supported |
-| Variable block sizes (< 64 tokens) | Not yet |
-| Head dim = 128 | Supported |
-| Head dim = 64 | Not yet instantiated |
-| Torch autograd integration | Not yet |
+| Feature | Status | FastVideo Usage |
+|---------|--------|-----------------|
+| Forward pass (bf16) | Supported | Primary dtype |
+| Forward pass (fp16) | Supported by CK | Some models |
+| Backward pass | Not yet integrated | Required for training |
+| Symmetric Q/KV lengths | Supported | Common case |
+| Asymmetric Q/KV lengths | Supported | Cross-attention |
+| Variable block sizes (< 64 tokens) | **Not yet — needed** | 3D tiles (4x4x4) produce partial edge blocks when video dims aren't divisible by 4 |
+| Head dim = 128 | Supported | LTX2, GameCraft, Gen3C, Wan |
+| Head dim = 64 | **Not yet — needed** | Used by some model configs and vmoba |
+| Torch autograd integration | Not yet | Required for training |
