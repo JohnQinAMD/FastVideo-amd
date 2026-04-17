@@ -203,7 +203,7 @@ output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
 | Backward pass | Not yet integrated | Required for training |
 | Symmetric Q/KV lengths | Supported | Common case |
 | Asymmetric Q/KV lengths | Supported | Cross-attention |
-| Variable block sizes (< 64 tokens) | **Not yet — needed** | 3D tiles (4x4x4) produce partial edge blocks when video dims aren't divisible by 4 |
+| Variable block sizes (< 64 tokens) | **Supported** | 3D tiles (4x4x4) produce partial edge blocks; LSE post-correction handles diluted softmax |
 | Head dim = 128 | Supported | LTX2, GameCraft, Gen3C, Wan |
-| Head dim = 64 | **Not yet — needed** | Used by some model configs and vmoba |
+| Head dim = 64 | **Supported** | Used by some model configs and vmoba |
 | Torch autograd integration | Not yet | Required for training |

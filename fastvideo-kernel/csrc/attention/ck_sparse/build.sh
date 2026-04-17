@@ -50,6 +50,9 @@ CODEGEN_DIR="${BUILD_DIR}/codegen"
 mkdir -p "${CODEGEN_DIR}"
 
 if [ ! -f "${CODEGEN_DIR}/fmha_vsa_fwd_api.cpp" ]; then
+    echo "Patching CK codegen for head_dim=64 support..."
+    python3 "${SCRIPT_DIR}/patch_codegen_d64.py" "${CK_DIR}"
+
     echo "Running CK codegen..."
     python3 "${CK_SPARSE_DIR}/generate.py" \
         --api fwd_vsa --receipt 600 \

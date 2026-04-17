@@ -77,8 +77,8 @@ def pytorch_reference(q, k, v, block_map, variable_block_sizes):
     return torch.matmul(attn, v_f)  # fp32 output
 
 
-def make_inputs(B, H, Sq, D, Sk, topk, seed=42):
-    """Create bf16 inputs (Triton hardcodes bf16 MFMA)."""
+def make_inputs(B, H, Sq, D, Sk, topk, seed=42, partial_blocks=False):
+    """Create bf16 inputs. If partial_blocks, some KV blocks have < 64 tokens."""
     torch.manual_seed(seed)
     q = torch.randn(B, H, Sq, D, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(B, H, Sk, D, dtype=torch.bfloat16, device="cuda")
@@ -93,7 +93,24 @@ def make_inputs(B, H, Sq, D, Sk, topk, seed=42):
     block_map.scatter_(-1, idx, True)
 
     q2k_idx, q2k_num = _map_to_index(block_map)
-    vbs = torch.full((nkv,), BLOCK, dtype=torch.int32, device="cuda")
+
+    if partial_blocks:
+        # Simulate FastVideo's 3D tiling: last block in each dim may be partial.
+        # Make ~25% of blocks have 16-48 tokens, rest have 64.
+        vbs = torch.full((nkv,), BLOCK, dtype=torch.int32, device="cuda")
+        torch.manual_seed(seed + 999)
+        partial_mask = torch.rand(nkv, device="cuda") < 0.25
+        partial_sizes = torch.randint(16, 49, (nkv,), device="cuda", dtype=torch.int32)
+        vbs[partial_mask] = partial_sizes[partial_mask]
+        # Zero out K/V at padded positions (simulates vsa_pad behavior)
+        for ki in range(nkv):
+            bs = vbs[ki].item()
+            if bs < BLOCK:
+                k[:, :, ki*BLOCK + bs : (ki+1)*BLOCK, :] = 0
+                v[:, :, ki*BLOCK + bs : (ki+1)*BLOCK, :] = 0
+    else:
+        vbs = torch.full((nkv,), BLOCK, dtype=torch.int32, device="cuda")
+
     return q, k, v, block_map, q2k_idx, q2k_num, vbs
 
 
@@ -156,43 +173,51 @@ class BenchResult:
 
 # ─────────────────────────── Correctness ───────────────────────────────────
 
-def run_three_way_test(B, H, Sq, D, Sk, topk, seed=42, skip_pytorch_ref=False) -> CorrectnessResult:
+def run_three_way_test(B, H, Sq, D, Sk, topk, seed=42, skip_pytorch_ref=False,
+                       partial_blocks=False) -> CorrectnessResult:
     """Three-way comparison: PyTorch fp32 vs Triton bf16 vs CK bf16."""
-    q, k, v, bm, q2k_idx, q2k_num, vbs = make_inputs(B, H, Sq, D, Sk, topk, seed)
+    q, k, v, bm, q2k_idx, q2k_num, vbs = make_inputs(
+        B, H, Sq, D, Sk, topk, seed, partial_blocks=partial_blocks)
 
     # Ground truth (skip for large seqlens to avoid OOM)
     ref = None
     if not skip_pytorch_ref:
         ref = pytorch_reference(q, k, v, bm, vbs)
 
-    # Triton
-    o_tri, _ = triton_block_sparse_attn_forward(q, k, v, q2k_idx, q2k_num, vbs)
-    torch.cuda.synchronize()
+    # Triton (only for D=128 — Triton hardcodes bf16 MFMA and uses BLOCK=64 fixed)
+    o_tri = None
+    if D == 128:
+        o_tri, _ = triton_block_sparse_attn_forward(q, k, v, q2k_idx, q2k_num, vbs)
+        torch.cuda.synchronize()
 
     # CK
-    o_ck, _ = ck_vsa_ops.ck_block_sparse_attn_fwd(q, k, v, q2k_idx, q2k_num, 64)
+    o_ck, _ = ck_vsa_ops.ck_block_sparse_attn_fwd(q, k, v, q2k_idx, q2k_num, vbs, 64)
     torch.cuda.synchronize()
 
-    triton_m = compute_metrics(ref, o_tri) if ref is not None else None
+    triton_m = compute_metrics(ref, o_tri) if (ref is not None and o_tri is not None) else None
     ck_m = compute_metrics(ref, o_ck) if ref is not None else None
-    ck_vs_tri = compute_metrics(o_tri.float(), o_ck)
+    ck_vs_tri = compute_metrics(o_tri.float(), o_ck) if o_tri is not None else None
 
     nkv = Sk // BLOCK
     density = topk / nkv * 100
 
     cfg = f"B={B} H={H} Sq={Sq} Sk={Sk} D={D} topk={topk} ({density:.0f}%)"
 
-    # Pass criteria: CK vs Triton cosine sim >= 0.99999 (they should nearly match)
-    # If fp32 ref available: also check CK vs fp32 cosine >= 0.9999
-    ck_tri_cos = ck_vs_tri["cosine_sim"]
-    passed = ck_tri_cos >= 0.99999
+    # Pass criteria:
+    # - If Triton available: CK vs Triton cosine >= 0.99999
+    # - If fp32 ref available: CK vs fp32 cosine >= 0.9999
+    # - If only CK vs fp32 (no Triton, e.g. D=64): CK vs fp32 cosine >= 0.9999
+    passed = True
+    note = ""
+    if ck_vs_tri is not None:
+        passed = passed and ck_vs_tri["cosine_sim"] >= 0.99999
     if ck_m is not None:
         passed = passed and ck_m["cosine_sim"] >= 0.9999
-    note = ""
     if not passed:
-        note = f"CK-Tri cos={ck_tri_cos:.6f}"
-        if ck_m:
-            note += f" CK-ref cos={ck_m['cosine_sim']:.6f}"
+        parts = []
+        if ck_vs_tri: parts.append(f"CK-Tri cos={ck_vs_tri['cosine_sim']:.6f}")
+        if ck_m: parts.append(f"CK-ref cos={ck_m['cosine_sim']:.6f}")
+        note = " ".join(parts)
 
     return CorrectnessResult(
         config=cfg,
@@ -241,6 +266,9 @@ def run_correctness_tests() -> List[CorrectnessResult]:
         (1, 1, 64, 128, 64, 1),
         (1, 24, 4096, 128, 4096, 1),
         (1, 1, 4096, 128, 4096, 64),
+        # Head dim = 64 (CK vs fp32 only — Triton hardcodes D=128 MFMA)
+        (1, 12, 4096, 64, 4096, 6),
+        (1, 12, 4096, 64, 4096, 32),
     ]
 
     hdr = (f"{'Config':<48} {'':>3} {'Cos Sim':>9} {'NRMSE':>9} {'MaxAbs':>9} "
@@ -262,24 +290,44 @@ def run_correctness_tests() -> List[CorrectnessResult]:
             print(f"{r.config:<48}" + fmt_line("Tri", r.triton_metrics)[48:])
         if r.ck_metrics:
             print(fmt_line("CK ", r.ck_metrics) + f"  [{status}]")
-        elif r.triton_metrics is None:
-            print(f"{r.config:<48} (fp32 ref skipped — large seqlen)")
-        cv = r.ck_vs_triton_metrics
-        print(fmt_line("C-T", cv) + (f"  [{status}]" if r.ck_metrics is None else ""))
+        if r.ck_vs_triton_metrics:
+            print(fmt_line("C-T", r.ck_vs_triton_metrics) +
+                  (f"  [{status}]" if r.ck_metrics is None else ""))
+        elif r.ck_metrics is None:
+            print(f"{r.config:<48} (CK vs fp32 only)  [{status}]")
         print()
 
+    # Variable block sizes (partial blocks, simulates FastVideo 3D tiling edge cases)
+    print("\n--- Variable block sizes (partial blocks) ---")
+    vbs_configs = [
+        (1, 4, 512, 128, 512, 4),
+        (1, 12, 4096, 128, 4096, 6),
+        (1, 12, 4096, 128, 4096, 32),
+    ]
+    for cfg in vbs_configs:
+        r = run_three_way_test(*cfg, partial_blocks=True)
+        results.append(r)
+        status = "OK" if r.passed else "!!"
+        cm = r.ck_metrics
+        if cm:
+            print(f"  [{status}] B={cfg[0]} H={cfg[1]} Sq={cfg[2]} D={cfg[3]} topk={cfg[5]} (partial)"
+                  f"  CK-ref cos={cm['cosine_sim']:.6f}  nrmse={cm['nrmse']:.5f}")
+
     # Multi-seed stability
-    print("--- Multi-seed stability (10 seeds, Sq=4096, H=12, topk=6) ---")
+    print("\n--- Multi-seed stability (10 seeds, Sq=4096, H=12, topk=6) ---")
     seed_results = []
     for seed in range(10):
         r = run_three_way_test(1, 12, 4096, 128, 4096, 6, seed=seed)
         seed_results.append(r)
-    tri_cos = [r.triton_metrics["cosine_sim"] for r in seed_results]
-    ck_cos = [r.ck_metrics["cosine_sim"] for r in seed_results]
-    ct_cos = [r.ck_vs_triton_metrics["cosine_sim"] for r in seed_results]
-    print(f"  Triton vs fp32:  cos_sim min={min(tri_cos):.6f}  avg={sum(tri_cos)/len(tri_cos):.6f}")
-    print(f"  CK vs fp32:     cos_sim min={min(ck_cos):.6f}  avg={sum(ck_cos)/len(ck_cos):.6f}")
-    print(f"  CK vs Triton:   cos_sim min={min(ct_cos):.6f}  avg={sum(ct_cos)/len(ct_cos):.6f}")
+    tri_cos = [r.triton_metrics["cosine_sim"] for r in seed_results if r.triton_metrics]
+    ck_cos = [r.ck_metrics["cosine_sim"] for r in seed_results if r.ck_metrics]
+    ct_cos = [r.ck_vs_triton_metrics["cosine_sim"] for r in seed_results if r.ck_vs_triton_metrics]
+    if tri_cos:
+        print(f"  Triton vs fp32:  cos_sim min={min(tri_cos):.6f}  avg={sum(tri_cos)/len(tri_cos):.6f}")
+    if ck_cos:
+        print(f"  CK vs fp32:     cos_sim min={min(ck_cos):.6f}  avg={sum(ck_cos)/len(ck_cos):.6f}")
+    if ct_cos:
+        print(f"  CK vs Triton:   cos_sim min={min(ct_cos):.6f}  avg={sum(ct_cos)/len(ct_cos):.6f}")
 
     return results
 
@@ -335,7 +383,7 @@ def run_benchmarks() -> List[BenchResult]:
             warmup=5, rep=30)
 
         ms_ck = do_bench(
-            lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(q, k, v, q2k_idx, q2k_num, 64),
+            lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(q, k, v, q2k_idx, q2k_num, vbs, 64),
             warmup=5, rep=30)
 
         speedup = ms_tri / ms_ck

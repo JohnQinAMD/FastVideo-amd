@@ -1,13 +1,17 @@
 """
-CK-tile block-sparse attention dispatch (forward only, Phase 1).
+CK-tile block-sparse attention dispatch (forward).
 
 Loads the compiled CK extension and provides a drop-in replacement for
 the Triton forward path used in block_sparse_attn.py.
+
+Supports:
+  - bf16 and fp16
+  - head_dim = 64 or 128
+  - variable block sizes (partial blocks with < 64 valid tokens)
 """
 from __future__ import annotations
 
 import os
-import math
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -17,16 +21,12 @@ _ck_vsa_mod = None
 
 
 def _load_ck_extension():
-    """Lazily load the compiled CK VSA shared library."""
     global _ck_vsa_mod
     if _ck_vsa_mod is not None:
         return _ck_vsa_mod
 
-    # Search paths for the compiled .so
     search_dirs = [
-        # Built by csrc/attention/ck_sparse/build.sh
         Path(__file__).resolve().parent.parent.parent / "csrc" / "attention" / "ck_sparse" / "build",
-        # Env override
         Path(os.environ.get("CK_VSA_LIB_DIR", "/dev/null")),
     ]
 
@@ -46,40 +46,31 @@ def _load_ck_extension():
     )
 
 
-def _is_gfx9() -> bool:
-    """Check if current GPU is AMD gfx9xx (MI300/MI355 series)."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        props = torch.cuda.get_device_properties(0)
-        # ROCm exposes gcnArchName; fallback to checking device name.
-        name = getattr(props, "gcnArchName", "") or props.name
-        return "gfx9" in name.lower() or "mi3" in name.lower()
-    except Exception:
-        return False
-
-
 def ck_block_sparse_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     q2k_index: torch.Tensor,
     q2k_num: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
     block_m: int = 64,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     CK-tile block-sparse attention forward.
 
     Args:
-        q: [B, H, Sq, D] bf16/fp16
+        q: [B, H, Sq, D] bf16/fp16, D must be 64 or 128
         k: [B, H, Sk, D]
         v: [B, H, Sk, D]
-        q2k_index: [B, H, Q_blocks, max_kv_blks] int32 **absolute** block indices
+        q2k_index: [B, H, Q_blocks, max_kv_blks] int32 absolute block indices
         q2k_num:   [B, H, Q_blocks] int32 valid block counts
-        block_m:   CK tile M dimension (64 or 128)
+        variable_block_sizes: [num_kv_blocks] int32 — tokens per KV block (1..64)
+        block_m:   CK tile M dimension (64)
 
     Returns:
         (output, lse): output [B,H,Sq,D] same dtype as q; lse [B,H,Sq] fp32
     """
     mod = _load_ck_extension()
-    return mod.ck_block_sparse_attn_fwd(q, k, v, q2k_index, q2k_num, block_m)
+    return mod.ck_block_sparse_attn_fwd(
+        q, k, v, q2k_index, q2k_num, variable_block_sizes, block_m
+    )
