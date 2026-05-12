@@ -170,11 +170,9 @@ ck_block_sparse_attn_fwd(
     torch::Tensor variable_block_sizes, // [num_kv_blocks]               int32 (tokens per KV block)
     int block_m,                        // 64 — CK tile selection
     c10::optional<torch::Tensor> q2k_delta_opt = c10::nullopt,
-                                        // [B, H, Q_blks, max_kv_blks] int32 delta LUT; when
-                                        // provided (e.g. from the fused triton producer), the
-                                        // abs→delta launch here is skipped.
-    bool skip_vbs_correction = false)   // when true, skip the VBS output correction kernel
-                                        // entirely (safe when all block sizes == 64).
+                                        // accepted for API back-compat; ignored
+                                        // (CK pipeline consumes absolute indices directly).
+    bool skip_vbs_correction = true)    // pass false when any KV block size != 64
 {
     TORCH_CHECK(q.is_cuda(), "q must be CUDA");
     TORCH_CHECK(q.dim() == 4, "q must be [B,H,Sq,D]");
@@ -202,25 +200,9 @@ ck_block_sparse_attn_fwd(
 
     hipStream_t stream = nullptr;
 
-    // --- Delta LUT (for CK pipeline) ---
-    torch::Tensor delta_lut;
-    if (q2k_delta_opt.has_value()) {
-        delta_lut = *q2k_delta_opt;
-        TORCH_CHECK(delta_lut.is_contiguous(), "q2k_delta must be contiguous");
-        TORCH_CHECK(delta_lut.sizes() == q2k_index.sizes(),
-                    "q2k_delta must have the same shape as q2k_index");
-    } else {
-        delta_lut = torch::empty_like(q2k_index);
-        int total_rows = B * H * Q_blks;
-        int threads = 256;
-        int blocks  = (total_rows + threads - 1) / threads;
-        abs_to_delta_kernel<<<blocks, threads, 0, stream>>>(
-            q2k_index.data_ptr<int32_t>(),
-            q2k_num.data_ptr<int32_t>(),
-            delta_lut.data_ptr<int32_t>(),
-            max_kv_blks,
-            total_rows);
-    }
+    // CK pipeline computes delta inline from absolute indices; pass q2k_index directly.
+    (void)q2k_delta_opt;
+    const torch::Tensor& delta_lut = q2k_index;
 
     // --- Build CK args ---
     const float scale_s = 1.0f / std::sqrt(static_cast<float>(D));
@@ -312,5 +294,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("variable_block_sizes"),
           py::arg("block_m") = 64,
           py::arg("q2k_delta") = c10::nullopt,
-          py::arg("skip_vbs_correction") = false);
+          py::arg("skip_vbs_correction") = true);
 }

@@ -223,8 +223,14 @@ def run_three_way_test(B, H, Sq, D, Sk, topk, seed=42, skip_pytorch_ref=False,
         o_tri, _ = triton_block_sparse_attn_forward(q, k, v, q2k_idx, q2k_num, vbs)
         torch.cuda.synchronize()
 
-    # CK
-    o_ck, _ = ck_vsa_ops.ck_block_sparse_attn_fwd(q, k, v, q2k_idx, q2k_num, vbs, 64)
+    # CK — for partial-block tests, explicitly opt in to the VBS correction
+    # kernel (the new C++ default is skip_vbs_correction=true, which matches
+    # the common all-full-blocks case).
+    o_ck, _ = ck_vsa_ops.ck_block_sparse_attn_fwd(
+        q, k, v, q2k_idx, q2k_num, vbs, 64,
+        None,                                     # q2k_delta
+        not partial_blocks,                       # skip_vbs_correction
+    )
     torch.cuda.synchronize()
 
     triton_m = compute_metrics(ref, o_tri) if (ref is not None and o_tri is not None) else None

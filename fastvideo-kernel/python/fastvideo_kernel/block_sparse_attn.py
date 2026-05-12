@@ -24,10 +24,33 @@ def _is_sm90() -> bool:
     return major == 9 and minor == 0
 
 
+def _is_amd_gfx950() -> bool:
+    """gfx950 (MI355X) where the CK VSA extension is built and tuned."""
+    if not torch.cuda.is_available():
+        return False
+    if not torch.version.hip:
+        return False
+    try:
+        name = torch.cuda.get_device_properties(0).gcnArchName  # type: ignore[attr-defined]
+    except Exception:
+        return False
+    return "gfx950" in name
+
+
 def _force_triton() -> bool:
     # Force Triton even on SM90 and even if the compiled extension is available.
     # Useful for CI / debugging / parity testing.
     return os.environ.get("FASTVIDEO_KERNEL_VSA_FORCE_TRITON", "0") == "1"
+
+
+def _force_ck() -> bool:
+    """Force the AMD CK VSA path even if heuristics would otherwise pick Triton."""
+    return os.environ.get("FASTVIDEO_KERNEL_VSA_FORCE_CK", "0") == "1"
+
+
+def _disable_ck() -> bool:
+    """Hard kill-switch for the AMD CK path."""
+    return os.environ.get("FASTVIDEO_KERNEL_VSA_DISABLE_CK", "0") == "1"
 
 
 def _map_to_index(block_map: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -272,6 +295,74 @@ def _setup_context_sm90(ctx, inputs, output):
 block_sparse_attn_sm90.register_autograd(_backward_sm90, setup_context=_setup_context_sm90)
 
 
+@torch.library.custom_op(
+    "fastvideo_kernel::block_sparse_attn_ck_amd",
+    mutates_args=(),
+    device_types="cuda",
+)
+def block_sparse_attn_ck_amd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_map: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """AMD CK VSA forward dispatch arm.
+
+    Routes through the FastVideo CK extension (build_hd HD bk0=64 tile when
+    density >= 30% via density-based dispatch in ck_sparse_attn.py; else
+    stock build/ tile). Block-map → q2k_index/q2k_num conversion uses the
+    same Triton helper as the other arms.
+    """
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    block_map = block_map.to(torch.bool)
+    q2k_idx, q2k_num = _map_to_index(block_map)
+
+    from fastvideo_kernel.ck_sparse_attn import ck_block_sparse_attn_fwd  # local import
+
+    # block_m inferred from the mask's Q-block granularity: Sq/Q_blks == 128 → 128, == 64 → 64.
+    Sq = q.shape[2]
+    q_blks = q2k_idx.shape[2]
+    block_m = Sq // max(1, q_blks)
+    if block_m not in (64, 128):
+        raise RuntimeError(
+            f"CK arm: unexpected block_m={block_m} (Sq={Sq}, Q_blks={q_blks}); "
+            "expected 64 or 128."
+        )
+
+    o, lse = ck_block_sparse_attn_fwd(
+        q, k, v, q2k_idx, q2k_num, variable_block_sizes.int(), block_m=block_m
+    )
+    return o, lse
+
+
+@torch.library.register_fake("fastvideo_kernel::block_sparse_attn_ck_amd")
+def _block_sparse_attn_ck_amd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_map: torch.Tensor,
+    variable_block_sizes: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    o = torch.empty_like(q)
+    lse = torch.empty(
+        (q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32
+    )
+    return o, lse
+
+
+def _ck_amd_extension_available() -> bool:
+    """Return True only if the build/ stock CK .so exists. The HD .so is
+    optional (ck_sparse_attn falls back to stock when HD is absent)."""
+    try:
+        from fastvideo_kernel.ck_sparse_attn import _load_ck_extension  # type: ignore
+        return _load_ck_extension() is not None
+    except Exception:
+        return False
+
+
 def block_sparse_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -282,11 +373,27 @@ def block_sparse_attn(
     """
     Unified block-sparse attention op with autograd support.
     - On SM90 with compiled extension present: uses fastvideo_kernel_ops.block_sparse_fwd/bwd.
+    - On AMD gfx950 with CK extension present: uses ck_block_sparse_attn_fwd
+      (HD bk0=64 tile + density dispatch + auto-uniform skip).
     - Otherwise: uses Triton implementation (requires q/k/v to have same padded length today).
+
+    Override env vars (in priority order):
+      FASTVIDEO_KERNEL_VSA_DISABLE_CK=1  -> never use the AMD CK arm
+      FASTVIDEO_KERNEL_VSA_FORCE_CK=1    -> force AMD CK arm (fail if unavailable)
+      FASTVIDEO_KERNEL_VSA_FORCE_TRITON=1 -> force Triton (overrides SM90 path)
     """
     block_sparse_fwd, block_sparse_bwd = _get_sm90_ops()
     if (not _force_triton()) and _is_sm90() and (block_sparse_fwd is not None) and (block_sparse_bwd is not None):
         return block_sparse_attn_sm90(q, k, v, block_map, variable_block_sizes)
+    # AMD CK arm: gfx950 + extension built (or explicit force).
+    use_ck = (
+        not _disable_ck()
+        and not _force_triton()
+        and (_force_ck() or _is_amd_gfx950())
+        and _ck_amd_extension_available()
+    )
+    if use_ck:
+        return block_sparse_attn_ck_amd(q, k, v, block_map, variable_block_sizes)
     # Triton path: supports q_seq_len != kv_seq_len as long as both are padded
     # to a multiple of the block size (64 tokens).
     return block_sparse_attn_triton(q, k, v, block_map, variable_block_sizes)

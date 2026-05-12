@@ -78,6 +78,7 @@ COMMON_FLAGS=(
     --offload-arch=${GPU_ARCH}
     -DCK_TILE_USE_BUFFER_ADDRESSING_BUILTIN
     -DCK_TILE_FMHA_FWD_FAST_EXP2
+    ${CK_VSA_EXTRA_FLAGS:-}
     -Wno-undefined-func-template
     -Wno-float-equal
     -I"${CK_DIR}/include"
