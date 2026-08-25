@@ -47,6 +47,7 @@ echo "GPU_ARCH=${GPU_ARCH}"
 
 # --- Step 1: Run CK codegen to generate kernel instances ---
 CODEGEN_DIR="${BUILD_DIR}/codegen"
+VBS_DIR="${BUILD_DIR}/vbs"
 mkdir -p "${CODEGEN_DIR}"
 
 if [ ! -f "${CODEGEN_DIR}/fmha_vsa_fwd_api.cpp" ]; then
@@ -61,6 +62,22 @@ if [ ! -f "${CODEGEN_DIR}/fmha_vsa_fwd_api.cpp" ]; then
 else
     echo "Codegen already done (${CODEGEN_DIR}/fmha_vsa_fwd_api.cpp exists)."
 fi
+
+# Let the variable-block mask reach its valid-length table. Runs unconditionally
+# because it edits a CK header the codegen step above does not touch, and a
+# freshly checked out CK tree needs it even when codegen output is cached. It
+# rewrites a header every instance includes, so drop stale objects when it fires
+# (the object rules below only compare source timestamps).
+VSA_KERNEL_HDR="${CK_DIR}/include/ck_tile/ops/sparse_attn/kernel/fmha_fwd_vsa_kernel.hpp"
+if ! grep -q "vsa_mask_needs_block_table" "${VSA_KERNEL_HDR}"; then
+    python3 "${SCRIPT_DIR}/patch_ck_vbs_mask.py" "${CK_DIR}"
+    rm -rf "${BUILD_DIR}/obj"
+else
+    echo "CK variable-block mask hook already present."
+fi
+
+echo "Generating variable-block-mask instances..."
+python3 "${SCRIPT_DIR}/gen_vbs_instances.py" "${VBS_DIR}"
 
 # --- Step 2: Compile all .cpp/.hip sources into .o files ---
 HIPCC="${ROCM_PATH:-/opt/rocm}/bin/hipcc"
@@ -83,6 +100,7 @@ COMMON_FLAGS=(
     -Wno-float-equal
     -I"${CK_DIR}/include"
     -I"${CK_DIR}/include/ck_tile/ops/sparse_attn"
+    -I"${SCRIPT_DIR}"
     -I"${CK_SPARSE_DIR}"
     -I"${CK_FMHA_DIR}"
     -I"${CK_EXAMPLE_DIR}"
@@ -96,8 +114,9 @@ mkdir -p "${OBJ_DIR}"
 echo "Compiling kernel instances..."
 OBJS=()
 
-# Compile CK codegen'd kernel files (in parallel).
-for src in "${CODEGEN_DIR}"/*.cpp; do
+# Compile CK codegen'd kernel files and the variable-block-mask instances (in
+# parallel).
+for src in "${CODEGEN_DIR}"/*.cpp "${VBS_DIR}"/*.cpp; do
     base=$(basename "${src}" .cpp)
     obj="${OBJ_DIR}/${base}.o"
     OBJS+=("${obj}")

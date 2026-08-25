@@ -67,7 +67,7 @@ def ck_block_sparse_attn_fwd(
     q2k_num: torch.Tensor,
     variable_block_sizes: torch.Tensor,
     block_m: int = 64,
-    skip_vbs_correction: Optional[bool] = None,
+    uniform_block_sizes: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     CK-tile block-sparse attention forward.
@@ -79,23 +79,27 @@ def ck_block_sparse_attn_fwd(
         q2k_index: [B, Hq, Q_blocks, max_kv_blks] int32 absolute block indices,
                    indexed by query head even when Hkv < Hq
         q2k_num:   [B, Hq, Q_blocks] int32 valid block counts
-        variable_block_sizes: [num_kv_blocks] int32 — tokens per KV block (1..64)
+        variable_block_sizes: [num_kv_blocks] int32 — tokens per KV block
+                   (1..64), one entry per block of the padded Sk
         block_m:   CK tile M dimension (64)
-        skip_vbs_correction: tri-state.
-                   None  -> auto-detect: skip iff all variable_block_sizes==64
-                   True  -> always skip (caller asserts no partial blocks)
-                   False -> always run the correction kernel
+        uniform_block_sizes: tri-state performance hint.
+                   None  -> auto-detect: True iff all variable_block_sizes==64
+                   True  -> caller asserts no partial blocks, so the kernel can
+                            skip the padding mask entirely
+                   False -> run the instance that masks partial blocks
+
+    Both paths are numerically correct; a wrong True is not, since it lets the
+    padding in a partial block reach the softmax.
 
     Returns:
         (output, lse): output [B,Hq,Sq,D] same dtype as q; lse [B,Hq,Sq] fp32
     """
-    # Auto-detect uniform mask -> skip the vbs correction launch. This reads
-    # a device tensor, so pass skip_vbs_correction explicitly to avoid the
-    # host sync on a hot path.
-    if skip_vbs_correction is None:
-        skip_vbs_correction = _is_uniform_mask(variable_block_sizes)
+    # Auto-detect reads a device tensor, so pass uniform_block_sizes explicitly
+    # to avoid the host sync on a hot path.
+    if uniform_block_sizes is None:
+        uniform_block_sizes = _is_uniform_mask(variable_block_sizes)
 
     return _load_ck_extension().ck_block_sparse_attn_fwd(
         q, k, v, q2k_index, q2k_num, variable_block_sizes, block_m,
-        skip_vbs_correction
+        uniform_block_sizes
     )

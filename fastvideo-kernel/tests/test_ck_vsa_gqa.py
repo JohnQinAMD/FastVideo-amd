@@ -147,7 +147,7 @@ def test_gqa_matches_dense_reference(B, Hq, Hkv, dtype, block_m):
     idx, num, kv_blks = build_lut(B, Hq, Sq, Sk, block_m, 0.25, "cuda")
     vbs = torch.full((kv_blks,), BLOCK_KV, dtype=torch.int32, device="cuda")
 
-    o, lse = ck_fwd(q, k, v, idx, num, vbs, block_m, skip_vbs_correction=True)
+    o, lse = ck_fwd(q, k, v, idx, num, vbs, block_m, uniform_block_sizes=True)
     ref, ref_lse = reference(q, k, v, idx, num, block_m)
     assert_close(o, lse, ref, ref_lse)
 
@@ -169,14 +169,14 @@ def test_gqa_with_asymmetric_q_kv_lengths(B, Hq, Hkv, Sq, Sk):
     idx, num, kv_blks = build_lut(B, Hq, Sq, Sk, block_m, 0.25, "cuda", seed=4)
     vbs = torch.full((kv_blks,), BLOCK_KV, dtype=torch.int32, device="cuda")
 
-    o, lse = ck_fwd(q, k, v, idx, num, vbs, block_m, skip_vbs_correction=True)
+    o, lse = ck_fwd(q, k, v, idx, num, vbs, block_m, uniform_block_sizes=True)
     ref, ref_lse = reference(q, k, v, idx, num, block_m)
     assert_close(o, lse, ref, ref_lse)
 
 
 @pytest.mark.parametrize("block_m", [64, 128])
 def test_gqa_with_variable_block_sizes(block_m):
-    """GQA on top of ragged KV blocks, which also runs the correction kernel."""
+    """GQA on top of ragged KV blocks, which also exercises the padding mask."""
     ck_fwd = _ck_fwd()
     B, Hq, Hkv, Sq, Sk, D = 2, 8, 2, 512, 512, 128
     torch.manual_seed(99)
@@ -193,16 +193,13 @@ def test_gqa_with_variable_block_sizes(block_m):
         k[:, :, blk * BLOCK_KV + real : (blk + 1) * BLOCK_KV] = 0
         v[:, :, blk * BLOCK_KV + real : (blk + 1) * BLOCK_KV] = 0
 
-    o, _ = ck_fwd(q, k, v, idx, num, vbs.cuda(), block_m,
-                  skip_vbs_correction=False)
+    o, lse = ck_fwd(q, k, v, idx, num, vbs.cuda(), block_m,
+                    uniform_block_sizes=False)
     ref, ref_lse = reference(q, k, v, idx, num, block_m, vbs=vbs)
 
-    # LSE is checked by the uniform-block tests; here the kernel deliberately
-    # rewrites it to remove the padded positions, so only the output is compared.
-    of = o.float()
-    scale = ref.abs().amax().clamp_min(1e-6)
-    assert torch.isfinite(of).all()
-    assert (of - ref).abs().amax() / scale < 5e-2
+    # LSE is held to the same tolerance as the uniform-block tests: the padded
+    # positions never enter the denominator, so nothing rewrites it afterwards.
+    assert_close(o, lse, ref, ref_lse)
 
 
 @pytest.mark.parametrize("B,Hq,Hkv", [(1, 8, 2), (3, 8, 2), (2, 8, 1)])
@@ -224,11 +221,11 @@ def test_gqa_equals_replicated_kv(B, Hq, Hkv):
     vbs = torch.full((kv_blks,), BLOCK_KV, dtype=torch.int32, device="cuda")
 
     o_gqa, lse_gqa = ck_fwd(q, k, v, idx, num, vbs, block_m,
-                            skip_vbs_correction=True)
+                            uniform_block_sizes=True)
     o_mha, lse_mha = ck_fwd(q,
                             k.repeat_interleave(Hq // Hkv, dim=1).contiguous(),
                             v.repeat_interleave(Hq // Hkv, dim=1).contiguous(),
-                            idx, num, vbs, block_m, skip_vbs_correction=True)
+                            idx, num, vbs, block_m, uniform_block_sizes=True)
 
     assert torch.equal(o_gqa, o_mha)
     assert torch.equal(lse_gqa, lse_mha)
@@ -258,7 +255,7 @@ def test_output_identifies_the_kv_head_it_read(B, Hq, Hkv):
     idx, num, kv_blks = build_lut(B, Hq, Sq, Sk, block_m, 0.25, "cuda", seed=8)
     vbs = torch.full((kv_blks,), BLOCK_KV, dtype=torch.int32, device="cuda")
 
-    o, _ = ck_fwd(q, k, v, idx, num, vbs, block_m, skip_vbs_correction=True)
+    o, _ = ck_fwd(q, k, v, idx, num, vbs, block_m, uniform_block_sizes=True)
 
     expected = torch.stack([
         torch.stack([labels[b * Hkv + h // group].expand(Sq, D) for h in range(Hq)])
@@ -298,7 +295,7 @@ def test_output_identifies_the_k_head_it_read(B, Hq, Hkv):
     idx, num, kv_blks = build_lut(B, Hq, Sq, Sk, block_m, 1.0, "cuda", seed=2)
     vbs = torch.full((kv_blks,), BLOCK_KV, dtype=torch.int32, device="cuda")
 
-    o, _ = ck_fwd(q, k, v, idx, num, vbs, block_m, skip_vbs_correction=True)
+    o, _ = ck_fwd(q, k, v, idx, num, vbs, block_m, uniform_block_sizes=True)
 
     got = o.float()[:, :, :, 0]
     for b in range(B):
@@ -322,7 +319,7 @@ def test_indivisible_head_count_is_rejected():
     vbs = torch.full((kv_blks,), BLOCK_KV, dtype=torch.int32, device="cuda")
 
     with pytest.raises(RuntimeError, match="divisible"):
-        ck_fwd(q, k, v, idx, num, vbs, block_m, skip_vbs_correction=True)
+        ck_fwd(q, k, v, idx, num, vbs, block_m, uniform_block_sizes=True)
 
 
 def test_mismatched_kv_shapes_are_rejected():
@@ -337,4 +334,4 @@ def test_mismatched_kv_shapes_are_rejected():
     vbs = torch.full((kv_blks,), BLOCK_KV, dtype=torch.int32, device="cuda")
 
     with pytest.raises(RuntimeError, match="same shape"):
-        ck_fwd(q, k, v, idx, num, vbs, block_m, skip_vbs_correction=True)
+        ck_fwd(q, k, v, idx, num, vbs, block_m, uniform_block_sizes=True)

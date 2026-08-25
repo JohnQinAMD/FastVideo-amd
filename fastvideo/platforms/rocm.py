@@ -72,7 +72,22 @@ class RocmPlatform(Platform):
         elif selected_backend in (AttentionBackendEnum.FLASH_ATTN, None):
             pass
 
-        elif selected_backend in (AttentionBackendEnum.SAGE_ATTN):
+        elif selected_backend == AttentionBackendEnum.VIDEO_SPARSE_ATTN:
+            try:
+                from fastvideo_kernel import video_sparse_attn  # noqa: F401
+
+                from fastvideo.attention.backends.video_sparse_attn import (  # noqa: F401
+                    VideoSparseAttentionBackend)
+                logger.info("Using Video Sparse Attention backend.")
+
+                return "fastvideo.attention.backends.video_sparse_attn.VideoSparseAttentionBackend"
+            except ImportError as e:
+                logger.error("Failed to import Video Sparse Attention backend: %s", str(e))
+                raise ImportError("The Video Sparse Attention backend is not installed. "
+                                  "To install it, please follow the instructions at: "
+                                  "https://hao-ai-lab.github.io/FastVideo/video_sparse_attention/installation ") from e
+
+        elif selected_backend == AttentionBackendEnum.SAGE_ATTN:
             raise ValueError(f"{selected_backend.name} is not supported on {cls.device_name}.")
         elif selected_backend:
             raise ValueError(f"Invalid attention backend for {cls.device_name}: {selected_backend}")
