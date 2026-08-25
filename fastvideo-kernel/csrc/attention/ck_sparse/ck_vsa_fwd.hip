@@ -136,11 +136,11 @@ __global__ void vbs_output_correction_kernel(
 // ---------------------------------------------------------------------------
 std::tuple<torch::Tensor, torch::Tensor>
 ck_block_sparse_attn_fwd(
-    torch::Tensor q,                    // [B, H, Sq, D]  bf16/fp16
-    torch::Tensor k,                    // [B, H, Sk, D]
-    torch::Tensor v,                    // [B, H, Sk, D]
-    torch::Tensor q2k_index,            // [B, H, Q_blks, max_kv_blks]  int32 absolute
-    torch::Tensor q2k_num,              // [B, H, Q_blks]               int32 counts
+    torch::Tensor q,                    // [B, Hq, Sq, D]  bf16/fp16
+    torch::Tensor k,                    // [B, Hkv, Sk, D]  Hkv may divide Hq (GQA/MQA)
+    torch::Tensor v,                    // [B, Hkv, Sk, D]
+    torch::Tensor q2k_index,            // [B, Hq, Q_blks, max_kv_blks] int32 absolute
+    torch::Tensor q2k_num,              // [B, Hq, Q_blks]              int32 counts
     torch::Tensor variable_block_sizes, // [num_kv_blocks]               int32 (tokens per KV block)
     int block_m,                        // 64 — CK tile selection
     bool skip_vbs_correction = true)    // pass false when any KV block size != 64
@@ -156,12 +156,23 @@ ck_block_sparse_attn_fwd(
     TORCH_CHECK(q2k_num.is_contiguous(), "q2k_num must be contiguous");
     TORCH_CHECK(variable_block_sizes.is_contiguous(),
                 "variable_block_sizes must be contiguous");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v must have the same shape");
 
     const int B  = q.size(0);
     const int H  = q.size(1);
     const int Sq = q.size(2);
     const int D  = q.size(3);
+    const int H_kv = k.size(1);
     const int Sk = k.size(2);
+
+    TORCH_CHECK(k.size(0) == B, "k batch (", k.size(0), ") must match q batch (", B, ")");
+    TORCH_CHECK(k.size(3) == D, "k head_dim (", k.size(3), ") must match q head_dim (", D, ")");
+    // The CK kernel selects a KV head as i_nhead / (nhead_q / nhead_k).
+    TORCH_CHECK(H_kv > 0 && H % H_kv == 0,
+                "query heads (", H, ") must be divisible by KV heads (", H_kv, ")");
+    TORCH_CHECK(q2k_index.size(1) == H && q2k_num.size(1) == H,
+                "the block LUT is indexed by query head, so it must have ", H,
+                " heads, got ", q2k_index.size(1));
     const int max_kv_blks = q2k_index.size(-1);
     const int BLOCK_KV = 64;
     const int Q_blks = q2k_index.size(2);
@@ -199,15 +210,15 @@ ck_block_sparse_attn_fwd(
     args.hdim_q   = D;
     args.hdim_v   = D;
     args.nhead_q  = H;
-    args.nhead_k  = H;
+    args.nhead_k  = H_kv;
     args.scale_s  = scale_s;
 
     args.stride_q = D;  args.stride_k = D;  args.stride_v = D;  args.stride_o = D;
     args.nhead_stride_q = Sq * D;  args.nhead_stride_k = Sk * D;
     args.nhead_stride_v = Sk * D;  args.nhead_stride_o = Sq * D;
     args.nhead_stride_lse = Sq;
-    args.batch_stride_q = H * Sq * D;  args.batch_stride_k = H * Sk * D;
-    args.batch_stride_v = H * Sk * D;  args.batch_stride_o = H * Sq * D;
+    args.batch_stride_q = H * Sq * D;  args.batch_stride_k = H_kv * Sk * D;
+    args.batch_stride_v = H_kv * Sk * D;  args.batch_stride_o = H * Sq * D;
     args.batch_stride_lse = H * Sq;
 
     args.window_size_left  = -1;

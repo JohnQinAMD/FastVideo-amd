@@ -8,6 +8,7 @@ Supports:
   - bf16 and fp16
   - head_dim = 64 or 128
   - variable block sizes (partial blocks with < 64 valid tokens)
+  - grouped-query and multi-query attention (Hkv dividing Hq)
 """
 from __future__ import annotations
 
@@ -72,11 +73,12 @@ def ck_block_sparse_attn_fwd(
     CK-tile block-sparse attention forward.
 
     Args:
-        q: [B, H, Sq, D] bf16/fp16, D must be 64 or 128
-        k: [B, H, Sk, D]
-        v: [B, H, Sk, D]
-        q2k_index: [B, H, Q_blocks, max_kv_blks] int32 absolute block indices
-        q2k_num:   [B, H, Q_blocks] int32 valid block counts
+        q: [B, Hq, Sq, D] bf16/fp16, D must be 64 or 128
+        k: [B, Hkv, Sk, D] — Hkv must divide Hq (Hkv < Hq is GQA/MQA)
+        v: [B, Hkv, Sk, D]
+        q2k_index: [B, Hq, Q_blocks, max_kv_blks] int32 absolute block indices,
+                   indexed by query head even when Hkv < Hq
+        q2k_num:   [B, Hq, Q_blocks] int32 valid block counts
         variable_block_sizes: [num_kv_blocks] int32 — tokens per KV block (1..64)
         block_m:   CK tile M dimension (64)
         skip_vbs_correction: tri-state.
@@ -85,7 +87,7 @@ def ck_block_sparse_attn_fwd(
                    False -> always run the correction kernel
 
     Returns:
-        (output, lse): output [B,H,Sq,D] same dtype as q; lse [B,H,Sq] fp32
+        (output, lse): output [B,Hq,Sq,D] same dtype as q; lse [B,Hq,Sq] fp32
     """
     # Auto-detect uniform mask -> skip the vbs correction launch. This reads
     # a device tensor, so pass skip_vbs_correction explicitly to avoid the

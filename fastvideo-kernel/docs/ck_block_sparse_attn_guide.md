@@ -353,5 +353,19 @@ Recorded here so the experiment is not repeated blindly:
 | block_m = 64 and 128 | Yes |
 | Variable block sizes | Yes |
 | Asymmetric Q/KV lengths | Yes |
+| Grouped / multi-query attention | Yes |
 | Backward pass | Not yet |
 | Torch autograd integration | Not yet |
+
+### Grouped-query attention
+
+`k`/`v` may carry fewer heads than `q` as long as the count divides evenly; the
+kernel selects a KV head as `i_nhead / (nhead_q / nhead_k)`. The block LUT is
+indexed by *query* head in every case, including MQA, because the kernel strides
+it by `nhead_q`. An indivisible head count is rejected rather than silently
+mis-strided.
+
+Kernel time is flat against replicated KV (0.99–1.02x at `Hq=24, Sq=32768`,
+10% density) — the arithmetic is unchanged. The win is not having to materialize
+the replicated KV: at `Hkv=2..8` that expansion costs ~0.24 ms per call and
+352 MiB, so end-to-end the native path is ~1.16x faster.

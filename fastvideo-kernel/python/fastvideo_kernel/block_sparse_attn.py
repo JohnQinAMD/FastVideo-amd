@@ -312,6 +312,9 @@ def block_sparse_attn_ck_amd(
     Routes through the FastVideo CK extension built by
     csrc/attention/ck_sparse/build.sh. Block-map → q2k_index/q2k_num
     conversion uses the same Triton helper as the other arms.
+
+    k/v may carry fewer heads than q (GQA/MQA) as long as the count divides
+    evenly; block_map stays indexed by query head either way.
     """
     q = q.contiguous()
     k = k.contiguous()
@@ -353,8 +356,7 @@ def _block_sparse_attn_ck_amd_fake(
 
 
 def _ck_amd_extension_available() -> bool:
-    """Return True only if the build/ stock CK .so exists. The HD .so is
-    optional (ck_sparse_attn falls back to stock when HD is absent)."""
+    """Return True only if the CK extension in build/ can be loaded."""
     try:
         from fastvideo_kernel.ck_sparse_attn import _load_ck_extension  # type: ignore
         return _load_ck_extension() is not None
