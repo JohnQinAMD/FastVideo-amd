@@ -202,10 +202,12 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
         constexpr auto gemm_0 = Policy::template GetQKBlockGemm<Problem>();
         constexpr auto gemm_1 = Policy::template GetKVBlockGemm<Problem>();
 
-        // The kv_block_idx_ptr LUT stores K-block indices in units of kN0; for
-        // asymmetric tiles (kM0=128, kN0=64) the starting offset must use kN0,
-        // not kM0 as upstream assumed.
-        int seqlen_k_start = kv_block_idx_ptr[0] * kN0;
+        // The kv_block_idx_ptr LUT stores absolute K-block indices in units of
+        // kN0; for asymmetric tiles (kM0=128, kN0=64) the starting offset must
+        // use kN0, not kM0 as upstream assumed. The traversal below steps by a
+        // delta, so it is differenced inline against the previous index.
+        int prev_abs_idx   = kv_block_idx_ptr[0];
+        int seqlen_k_start = prev_abs_idx * kN0;
         auto q_dram_window = make_tile_window(q_dram_block_window_tmp.get_bottom_tensor_view(),
                                               q_dram_block_window_tmp.get_window_lengths(),
                                               q_dram_block_window_tmp.get_window_origin(),
@@ -353,7 +355,9 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
             __builtin_amdgcn_s_barrier();
             __builtin_amdgcn_s_setprio(1);
 
-            int block_idx = kv_block_idx_ptr[i_total_loops + 1];
+            int curr_abs_idx = kv_block_idx_ptr[i_total_loops + 1];
+            int block_idx    = curr_abs_idx - prev_abs_idx;
+            prev_abs_idx     = curr_abs_idx;
             auto v_buf    = load_tile(v_dram_window, number<-1>{}, bool_constant<false>{});
             __builtin_amdgcn_sched_barrier(0);
             { // tail (i_k0 == k0_loops - 1)
