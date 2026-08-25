@@ -3,7 +3,7 @@
 ## TL;DR
 
 **2.0–2.7× forward speedup over the vanilla FastVideo Triton kernel**
-(MI355X, bf16, optimized path with fused delta + VBS skip + block_m=128).
+(MI355X, bf16, optimized path with VBS skip + block_m=128).
 
 | Config | FV Triton | CK opt | Speedup |
 |--------|-----------|--------|---------|
@@ -153,7 +153,7 @@ v = torch.randn(B, H, Sq, D, dtype=torch.bfloat16, device="cuda")
 variable_block_sizes = torch.full((nkv,), BLOCK_KV, dtype=torch.int32, device="cuda")
 
 os.environ["FASTVIDEO_KERNEL_VSA_FORCE_TRITON"] = "1"
-from fastvideo_kernel.triton_kernels.index import map_to_index_and_delta
+from fastvideo_kernel.triton_kernels.index import map_to_index
 
 # --- block_m=128 (fastest, recommended for Sq >= 8K) ---
 # Build block map at 128-token Q granularity, 64-token KV granularity
@@ -164,11 +164,11 @@ scores = torch.rand(B, H, nq, nkv, device="cuda")
 idx = torch.topk(scores, topk, dim=-1).indices
 block_map = torch.zeros(B, H, nq, nkv, dtype=torch.bool, device="cuda")
 block_map.scatter_(-1, idx, True)
-q2k_index, q2k_delta, q2k_num = map_to_index_and_delta(block_map)
+q2k_index, q2k_num = map_to_index(block_map)
 
 output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
     q, k, v, q2k_index, q2k_num, variable_block_sizes, block_m=128,
-    q2k_delta=q2k_delta, skip_vbs_correction=True,
+    skip_vbs_correction=True,
 )
 # output: [B, H, Sq, D] bf16
 # lse:    [B, H, Sq]    fp32
@@ -177,10 +177,10 @@ output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
 # Build block map at 64-token Q granularity
 # nq_64 = Sq // 64
 # block_map_64 = ...  # [B, H, nq_64, nkv]
-# q2k_index, q2k_delta, q2k_num = map_to_index_and_delta(block_map_64)
+# q2k_index, q2k_num = map_to_index(block_map_64)
 # output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
 #     q, k, v, q2k_index, q2k_num, variable_block_sizes, block_m=64,
-#     q2k_delta=q2k_delta, skip_vbs_correction=True,
+#     skip_vbs_correction=True,
 # )
 ```
 
@@ -200,58 +200,59 @@ Improvements below target per-call overhead — no CK-tile kernel changes.
    `pad_count == 0`, so launching unconditionally is cheaper than the
    sync. Largest win at small Sq (−25 % at Sq=4,096).
 
-2. **Fuse `abs → delta` into triton `map_to_index`.**
-   The CK VSA pipeline consumes a delta-encoded LUT. Previously the C++
-   wrapper launched a dedicated `abs_to_delta_kernel` between the
-   existing triton `map_to_index` and the CK kernel. The new
-   `map_to_index_and_delta_kernel` emits both the absolute LUT (still
-   needed by the VBS correction kernel) and the delta LUT in a single
-   triton launch; the C++ wrapper takes the delta as an optional kwarg
-   and skips the HIP launch when provided. Saves one kernel launch
-   (~5 µs) per forward.
-
-3. **Replace `.contiguous()` with `TORCH_CHECK(is_contiguous)`.**
+2. **Replace `.contiguous()` with `TORCH_CHECK(is_contiguous)`.**
    Minor — removes a handful of virtual dispatches per call.
 
 ## Phase 2 optimizations
 
 These target per-call overhead in the CK forward wrapper — eliminating
-redundant kernel launches when the caller can pre-compute the delta LUT
-or guarantee uniform block sizes.
+redundant kernel launches when the caller can guarantee uniform block
+sizes.
 
-4. **Skip VBS correction for uniform blocks.**
+3. **Skip VBS correction for uniform blocks.**
    [ck_vsa_fwd.hip](../csrc/attention/ck_sparse/ck_vsa_fwd.hip) now
    accepts `skip_vbs_correction=true`. When all KV block sizes are 64
    (the common uniform-grid case), the caller passes this flag to skip
    the VBS output correction kernel entirely. Saves ~5 µs per forward
    (one fewer kernel launch); most impactful at small Sq where it
-   represents 10-15 % of total runtime.
+   represents 10-15 % of total runtime. This is what the `opt/base`
+   column below measures; it leaves the CK attention kernel as the sole
+   GPU launch.
 
-5. **Pass pre-computed delta from Python.**
-   [ck_sparse_attn.py](../python/fastvideo_kernel/ck_sparse_attn.py)
-   now accepts `q2k_delta` and `skip_vbs_correction` kwargs and forwards
-   them to the C++ wrapper. Combined with `map_to_index_and_delta()`
-   (opt #2), the optimized call eliminates **both** the HIP abs→delta
-   kernel and the VBS correction kernel, leaving only the CK attention
-   kernel as the sole GPU launch.
+### A note on the LUT encoding
 
-### Measured gains (chi2761, MI355X)
+Earlier revisions of this branch passed a separately built,
+delta-encoded LUT to CK and credited it for part of the gain above. The
+CK VSA pipeline differences the **absolute** block indices inline, so
+the delta LUT was never read: `map_to_index` output is passed straight
+through as `lut_ptr`. The delta plumbing (`abs_to_delta_kernel`, the
+`q2k_delta` kwarg, `map_to_index_and_delta`) has been removed, and the
+gains above are attributable entirely to skipping the VBS correction.
+
+### Measured gains (MI355X, block_m=64, ~10 % density)
 
 | Sq | D | CK base (ms) | CK opt (ms) | opt/base | opt vs Triton |
 |----|---|-------------|-------------|----------|---------------|
-| 4,096 | 128 | 0.041 | **0.033** | **1.24×** | **1.66×** |
-| 8,192 | 128 | 0.107 | **0.086** | **1.24×** | **1.99×** |
-| 16,384 | 128 | 0.327 | **0.258** | **1.27×** | **2.45×** |
-| 32,768 | 128 | 1.142 | **0.934** | **1.22×** | **2.59×** |
-| 49,152 | 128 | 2.614 | **2.104** | **1.24×** | **2.69×** |
-| 65,536 | 128 | 4.657 | **3.771** | **1.24×** | **2.48×** |
-| 4,096 | 64 | 0.034 | **0.023** | **1.48×** | N/A |
-| 16,384 | 64 | 0.196 | **0.153** | **1.28×** | N/A |
-| 49,152 | 64 | 1.465 | **1.292** | **1.13×** | N/A |
+| 4,096 | 128 | 0.034 | **0.031** | **1.09×** | **1.76×** |
+| 8,192 | 128 | 0.096 | **0.092** | **1.05×** | **1.87×** |
+| 16,384 | 128 | 0.305 | **0.296** | **1.03×** | **2.13×** |
+| 32,768 | 128 | 1.094 | **1.076** | **1.02×** | **2.24×** |
+| 49,152 | 128 | 2.453 | **2.385** | **1.03×** | **2.21×** |
+| 65,536 | 128 | 4.373 | **4.308** | **1.02×** | **2.18×** |
+| 4,096 | 64 | 0.027 | **0.024** | **1.11×** | **1.22×** |
+| 16,384 | 64 | 0.169 | **0.164** | **1.03×** | **1.81×** |
+| 49,152 | 64 | 1.443 | **1.401** | **1.03×** | **1.77×** |
 
-Biggest wins at small Sq where eliminated kernel launches are a larger
-fraction of total runtime. Combined with block_m=128, CK opt achieves
-1.22–1.48× over CK base across all configs.
+Skipping the correction removes a fixed-cost launch, so the win is
+largest at small Sq (1.09–1.11× at Sq=4,096) and fades to ~1.02× once
+the attention kernel dominates. An earlier version of this table
+reported 1.22–1.48×; those figures were measured with `block_m=128` and
+also credited the delta LUT described above, which the kernel never
+read. For the `block_m=128` numbers see the Phase 3 table below.
+
+Note that the `CK base` arm must pass `skip_vbs_correction=False`
+explicitly. The C++ default is now `true`, so a call that omits the
+argument lands in the `CK opt` configuration.
 
 ## Phase 3: block_m=128 tile
 
@@ -274,16 +275,17 @@ with 64-token KV blocks (nkv = Sk/64), and pass `block_m=128`:
 nq_128 = Sq // 128
 nkv = Sk // 64
 block_map = ...  # [B, H, nq_128, nkv] bool
-q2k_index, q2k_delta, q2k_num = map_to_index_and_delta(block_map)
+q2k_index, q2k_num = map_to_index(block_map)
 output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
     q, k, v, q2k_index, q2k_num, vbs, block_m=128,
-    q2k_delta=q2k_delta, skip_vbs_correction=True,
+    skip_vbs_correction=True,
 )
 ```
 
 **When to use block_m=128 vs block_m=64:**
 - **block_m=128** — recommended for Sq ≥ 8,192 with uniform blocks.
-  1.18× faster than block_m=64 at same density; up to 2.69× over Triton.
+  1.20–1.24× faster than block_m=64 at same density; up to 2.74× over
+  Triton. At Sq=4,096 the two tiles are within 3 % of each other.
 - **block_m=64** — use for small Sq (< 8K), variable block sizes
   (partial blocks), or when 64-token Q granularity is required.
 
@@ -297,20 +299,50 @@ output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
 | WAIT_ANY/MFMA | 9.74 | **9.12** |
 | VMEM_INSTS/MFMA | ~7.4 | **0.29** |
 
-### Measured gains (chi2761, MI355X, D=128, ~10% density)
+### Measured gains (MI355X, D=128, ~10% density)
 
-| Sq | Triton (ms) | CK opt (ms) | Speedup |
-|----|-------------|-------------|--------:|
-| 4,096 | 0.054 | 0.033 | 1.66× |
-| 8,192 | 0.172 | **0.086** | **1.99×** |
-| 16,384 | 0.632 | **0.258** | **2.45×** |
-| 32,768 | 2.419 | **0.934** | **2.59×** |
-| 49,152 | 5.651 | **2.104** | **2.69×** |
-| 65,536 | 9.370 | **3.771** | **2.48×** |
+| Sq | Triton (ms) | CK m=64 (ms) | CK m=128 (ms) | m128/m64 | m128 vs Triton |
+|----|-------------|--------------|---------------|---------:|---------------:|
+| 4,096 | 0.054 | 0.032 | 0.031 | 1.03× | 1.76× |
+| 8,192 | 0.172 | 0.091 | **0.076** | **1.20×** | **2.26×** |
+| 16,384 | 0.632 | 0.303 | **0.247** | **1.23×** | **2.56×** |
+| 32,768 | 2.423 | 1.094 | **0.885** | **1.24×** | **2.74×** |
+| 49,152 | 5.300 | 2.419 | **1.982** | **1.22×** | **2.67×** |
+| 65,536 | 9.387 | 4.343 | **3.500** | **1.24×** | **2.68×** |
 
 ```bash
 python3 fastvideo-kernel/benchmarks/strict_test_ck_fwd.py --blockm128
 ```
+
+## The high-density (HD) build
+
+`csrc/attention/ck_sparse/build_hd.sh` produces a second extension whose
+pipeline is overridden by
+`build_hd/include_override/pipeline/block_fmha_pipeline_qr_ks_vs_async_vsa.hpp`.
+It was written when the stock CK codegen emitted a kK0=32 tile, to
+introduce a wider kK0=64 QK chunk plus a second QK accumulator that lets
+consecutive outer-K steps issue independently.
+
+**It is disabled by default and should stay that way on gfx950.** Two
+things changed underneath it:
+
+- The kK0=64 tile now ships in the stock CK codegen, so
+  `patch_codegen_hd.py` is a no-op — both builds already compile the
+  same `128x64x64x128x32x128` tile. `build_hd.sh` says as much in its
+  log: *"HD bk0=64 tile already present in upstream codegen"*.
+- What remains is the dual accumulator, and it costs more than it
+  returns. It raises the kernel's VGPR count from 96 to 104, which on
+  gfx950 (512 registers per SIMD) drops occupancy from 5 waves to 4.
+  Since the kernel is memory-latency-bound, losing a wave of latency
+  hiding outweighs the extra instruction-level parallelism: measured
+  1–14 % slower than the stock build across Sq ∈ {8K…64K} and
+  density ∈ {10 %, 30 %, 50 %}. Rebuilding the override with the
+  `s_setprio` hints but *without* the dual accumulator gives 88 VGPRs,
+  5 waves, and stock performance to within noise.
+
+Set `FASTVIDEO_KERNEL_CK_HD_THRESHOLD` to a density in [0, 1] to
+re-enable dispatch to it, e.g. when evaluating on an architecture with
+a larger register file.
 
 ## Supported Features
 
