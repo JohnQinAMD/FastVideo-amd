@@ -221,12 +221,12 @@ def run_three_way_test(B, H, Sq, D, Sk, topk, seed=42, skip_pytorch_ref=False,
         o_tri, _ = triton_block_sparse_attn_forward(q, k, v, q2k_idx, q2k_num, vbs)
         torch.cuda.synchronize()
 
-    # CK — for partial-block tests, explicitly opt in to the VBS correction
-    # kernel (the new C++ default is skip_vbs_correction=true, which matches
+    # CK — for partial-block tests, explicitly opt in to the instance that masks
+    # block padding (the C++ default is uniform_block_sizes=true, which matches
     # the common all-full-blocks case).
     o_ck, _ = ck_vsa_ops.ck_block_sparse_attn_fwd(
         q, k, v, q2k_idx, q2k_num, vbs, 64,
-        not partial_blocks,                       # skip_vbs_correction
+        not partial_blocks,                       # uniform_block_sizes
     )
     torch.cuda.synchronize()
 
@@ -441,12 +441,16 @@ def run_benchmarks() -> List[BenchResult]:
 # ─────────────────── Optimized Pipeline Benchmark ─────────────────────────
 
 def run_opt_benchmarks() -> List[BenchResult]:
-    """Benchmark the CK path with the VBS correction kernel skipped."""
+    """Benchmark the CK path with the block-padding mask skipped.
+
+    'base' masks partial blocks, 'opt' is the instance compiled without the
+    mask, which a caller gets by promising every KV block is full.
+    """
     from triton.testing import do_bench
 
     print()
     print("=" * 100)
-    print("OPTIMIZED PATH: skip VBS correction")
+    print("OPTIMIZED PATH: uniform blocks, no padding mask")
     print("=" * 100)
     print()
 

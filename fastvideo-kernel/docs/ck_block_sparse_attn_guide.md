@@ -168,7 +168,7 @@ q2k_index, q2k_num = map_to_index(block_map)
 
 output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
     q, k, v, q2k_index, q2k_num, variable_block_sizes, block_m=128,
-    skip_vbs_correction=True,
+    uniform_block_sizes=True,
 )
 # output: [B, H, Sq, D] bf16
 # lse:    [B, H, Sq]    fp32
@@ -180,7 +180,7 @@ output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
 # q2k_index, q2k_num = map_to_index(block_map_64)
 # output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
 #     q, k, v, q2k_index, q2k_num, variable_block_sizes, block_m=64,
-#     skip_vbs_correction=True,
+#     uniform_block_sizes=True,
 # )
 ```
 
@@ -192,13 +192,16 @@ and `block_m=64` or `block_m=128` Q-tile granularity.
 
 Improvements below target per-call overhead — no CK-tile kernel changes.
 
-1. **Drop the VBS host sync.**
+1. **Keep the block-size table off the host.**
    [ck_vsa_fwd.hip](../csrc/attention/ck_sparse/ck_vsa_fwd.hip) used to call
-   `variable_block_sizes.cpu()` to decide whether the VBS correction
-   kernel needed to launch; that forces a device→host sync on every
-   forward. The correction kernel already early-exits per-thread when
-   `pad_count == 0`, so launching unconditionally is cheaper than the
-   sync. Largest win at small Sq (−25 % at Sq=4,096).
+   `variable_block_sizes.cpu()` on every forward, which forces a
+   device→host sync. Nothing in the C++ layer reads the table on the host
+   any more; it is passed straight to the kernel as a device pointer.
+   Largest win at small Sq (−25 % at Sq=4,096).
+
+   The Python wrapper still inspects the table when `uniform_block_sizes`
+   is left at `None`, which does sync. Pass the flag explicitly on a hot
+   path.
 
 2. **Replace `.contiguous()` with `TORCH_CHECK(is_contiguous)`.**
    Minor — removes a handful of virtual dispatches per call.
@@ -206,18 +209,17 @@ Improvements below target per-call overhead — no CK-tile kernel changes.
 ## Phase 2 optimizations
 
 These target per-call overhead in the CK forward wrapper — eliminating
-redundant kernel launches when the caller can guarantee uniform block
-sizes.
+redundant work when the caller can guarantee uniform block sizes.
 
-3. **Skip VBS correction for uniform blocks.**
-   [ck_vsa_fwd.hip](../csrc/attention/ck_sparse/ck_vsa_fwd.hip) now
-   accepts `skip_vbs_correction=true`. When all KV block sizes are 64
-   (the common uniform-grid case), the caller passes this flag to skip
-   the VBS output correction kernel entirely. Saves ~5 µs per forward
-   (one fewer kernel launch); most impactful at small Sq where it
-   represents 10-15 % of total runtime. This is what the `opt/base`
-   column below measures; it leaves the CK attention kernel as the sole
-   GPU launch.
+3. **Skip the padding mask for uniform blocks.**
+   [ck_vsa_fwd.hip](../csrc/attention/ck_sparse/ck_vsa_fwd.hip) accepts
+   `uniform_block_sizes=true`. When all KV block sizes are 64 (the common
+   uniform-grid case) there is no padding to mask, so the wrapper
+   dispatches the instance compiled without the mask and the kernel skips
+   the per-element predicate. Most impactful at small Sq. The `opt/base`
+   column below was measured when this flag instead skipped a separate
+   correction kernel; see [Masking block padding](#masking-block-padding)
+   for what replaced it and what it costs.
 
 ### A note on the LUT encoding
 
@@ -250,9 +252,10 @@ reported 1.22–1.48×; those figures were measured with `block_m=128` and
 also credited the delta LUT described above, which the kernel never
 read. For the `block_m=128` numbers see the Phase 3 table below.
 
-Note that the `CK base` arm must pass `skip_vbs_correction=False`
-explicitly. The C++ default is now `true`, so a call that omits the
-argument lands in the `CK opt` configuration.
+The `CK base` arm here is the correction kernel that has since been
+deleted, so this table is a record of that change rather than of current
+behaviour. What the flag selects today is the masked or unmasked
+instance; both are numerically correct on uniform blocks.
 
 ## Phase 3: block_m=128 tile
 
@@ -278,7 +281,7 @@ block_map = ...  # [B, H, nq_128, nkv] bool
 q2k_index, q2k_num = map_to_index(block_map)
 output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
     q, k, v, q2k_index, q2k_num, vbs, block_m=128,
-    skip_vbs_correction=True,
+    uniform_block_sizes=True,
 )
 ```
 
@@ -343,6 +346,111 @@ Recorded here so the experiment is not repeated blindly:
   until the mismatch was found. A future retry on hardware with a
   larger register file should be re-derived against the CK revision of
   the day rather than resurrected from history.
+
+## Masking block padding
+
+VSA groups KV tokens into fixed 64-token cubes, so the tail of a partially
+filled cube is padding backed by zero K/V. A zero K row scores exactly `0`,
+which is only harmless while some real key in the row scores above zero: then
+the row max comes from real data and each padded slot contributes
+`exp(0 - m) < 1`. The moment *every* real score in a row is negative the row max
+is `0`, each padded slot contributes exactly `1`, and the denominator is set by
+however many padded slots the selected blocks happen to carry.
+
+The branch used to score the padding and rescale afterwards, dividing out
+`pad_count / exp2(lse)`. That cannot be recovered in fp32. A measured case from
+the 1.3B end-to-end run: 103 selected blocks, 6,592 slots, 5,200 real tokens,
+1,392 padded. Every real score was negative, so `exp2(lse) ≈ 1392` and
+`lse = 10.443 = log2(1392)` — the denominator was *entirely* padding to within
+fp32. Backing it out means evaluating `1 - pad_frac` where the true remainder is
+`2.9e-7`, below one ulp at magnitude 1. The output came back 1.43× the tensor
+scale away from the fp32 reference, and the LSE off by 22 log2 units.
+
+The kernel now removes those columns before the softmax instead, through CK's
+own `FmhaMask` extension point:
+
+* `fastvideo::VariableBlockMask`
+  ([vsa_variable_block_mask.hpp](../csrc/attention/ck_sparse/vsa_variable_block_mask.hpp))
+  answers `IsOutOfBound(qo, kv)` as `(kv % 64) >= valid[kv / 64]`. The absolute
+  column index is available because the pipeline's K window origin tracks
+  `abs_block_idx * kN0`, and `kN0 == 64` for every VSA instance, so one K tile
+  covers exactly one variable-size block. `IsEdgeTile` is therefore just
+  `valid[i_x / 64] < 64`, which lets full blocks skip the element sweep.
+* The mask needs a device pointer, and the mask object is built inside the
+  kernel from its kargs, so [patch_ck_vbs_mask.py](../csrc/attention/ck_sparse/patch_ck_vbs_mask.py)
+  adds a `block_size_ptr` member to CK's `FmhaFwdMaskKargs` and an opt-in trait
+  at the construction site. Every anchor is matched exactly and a miss is fatal,
+  so a CK bump that moves this code fails the build rather than quietly
+  reverting to contaminated denominators.
+* CK codegen cannot emit these instances — it picks a mask type from
+  `traits.mask_type`, which only describes window geometry — so
+  [gen_vbs_instances.py](../csrc/attention/ck_sparse/gen_vbs_instances.py)
+  emits the eight (dtype × head dim × `block_m`) instances and their dispatcher
+  alongside it.
+
+Turning masking on also enables two guards CK already had behind
+`FmhaMask::IsMasking`: a row whose every selected slot is padding gets a row max
+of `0` rather than `-inf` (no `inf - inf`), and its `l == 0` skips the reciprocal,
+so it yields zeros instead of NaN.
+
+### Why the existing tests did not catch it
+
+Nothing in `tests/test_ck_vsa_gqa.py` reaches the failing regime. With `D=128`
+and unit-variance Gaussian q/k, some selected key almost surely scores above
+zero, so the padding never dominates and rescaling recovers the answer to well
+inside tolerance. `tests/test_ck_vsa_block_padding.py` constructs the regime
+directly — Q pointing opposite to K, so every real score is negative by
+construction — and each test there also asserts the *unmasked* instance gets the
+same input badly wrong, so a regression that stops masking cannot pass by
+accident.
+
+### Measured effect (1.3B end-to-end, 90 attention calls)
+
+Each call's worst-disagreeing real token was recomputed exactly in fp32 against
+the blocks its LUT selected, and both the CK and Triton arms measured against
+that.
+
+| | before | after |
+|---|---|---|
+| worst CK error vs fp32 reference | 1.430 of tensor scale | 0.014 |
+| worst Triton error | 0.012 | 0.014 |
+| real tokens disagreeing > 1 % of scale | 142 / 35.4 M | 0 |
+| ... of those, > 10 % | 120 | 0 |
+| calls with any such token | 3 / 90 | 0 / 90 |
+| worst CK LSE error | 32.2 log2 units | 0.297 |
+
+The residual 0.297 is not a CK defect: Triton lands at 0.2968 on the same token
+and the two arms agree to 2.4e-4. At that token `q·k ≈ 651`, where bf16's 8-bit
+mantissa is worth ~0.33 log2 units after scaling — the arms are simply both a
+bf16 rounding away from an fp32 recomputation.
+
+This does **not** make the CK and Triton videos match: they sit at 26.9 dB PSNR
+before and after. Three DMD denoising steps amplify a bf16-level disagreement
+chaotically, so pixel metrics cannot settle whether a kernel is correct — which
+is why the table above adjudicates per call against fp32. Triton is
+bit-identical across runs, so the comparison is measuring the kernels and not
+run-to-run noise.
+
+### Cost
+
+`bench_vbs_mask.py`, at the shape the 1.3B run uses (`B=1, H=12, S=39936, D=128,
+block_m=64`, 103 of 624 blocks selected):
+
+| | ms | vs unmasked |
+|---|---|---|
+| unmasked instance | 2.634 | 1.000× |
+| masked, table says every block full | 2.751 | 1.045× |
+| masked, 1 block in 4 partial | 2.904 | 1.103× |
+
+So ~4 % comes from compiling the mask in at all — one `valid[]` load per KV tile
+plus the masking code's register pressure — and ~6 % more from sweeping the
+partial tiles. Occupancy is unchanged (`kBlockPerCu` depends on `kPadSeqLenK`,
+not on `IsMasking`, at `D=128`).
+
+The deleted correction kernel was not expensive enough to offset this: it
+re-read and re-wrote the output tensor, which floors at 0.037 ms here, so the
+net cost of correctness on this shape is ~1.09×. Callers with uniform blocks pay
+nothing, since they dispatch the unmasked instance.
 
 ## Supported Features
 
