@@ -353,5 +353,39 @@ Recorded here so the experiment is not repeated blindly:
 | block_m = 64 and 128 | Yes |
 | Variable block sizes | Yes |
 | Asymmetric Q/KV lengths | Yes |
+| Grouped / multi-query attention | Yes |
 | Backward pass | Not yet |
 | Torch autograd integration | Not yet |
+
+### Grouped-query attention
+
+`k`/`v` may carry fewer heads than `q` as long as the count divides evenly; the
+kernel selects a KV head as `i_nhead / (nhead_q / nhead_k)`. The block LUT is
+indexed by *query* head in every case, including MQA, because the kernel strides
+it by `nhead_q`. An indivisible head count is rejected rather than silently
+mis-strided.
+
+Kernel time is flat against replicated KV (0.99–1.02x at `Hq=24, Sq=32768`,
+10% density) — the arithmetic is unchanged. The win is not having to materialize
+the replicated KV: at `Hkv=2..8` that expansion costs ~0.24 ms per call and
+352 MiB, so end-to-end the native path is ~1.16x faster.
+
+#### Verifying KV addressing
+
+A cosine similarity over the whole output is a weak check here: it aggregates
+millions of elements, so a fault confined to one head or one batch is averaged
+away. `tests/test_ck_vsa_gqa.py` therefore judges on worst-element error and on
+LSE (which the kernel accumulates separately in fp32 and which matches the
+reference to ~1e-6, against ~2e-3 for a bf16 output), compares GQA bit-for-bit
+against the MHA path on replicated K/V, and adds two tests whose *inputs* are
+constructed so the output names the `(batch, KV head)` it was read from — a
+constant V per head means softmax weights sum to one and the output is that
+head's label exactly, whatever the mask.
+
+The shape list matters as much as the metrics. Two mutations of the addressing
+code are invisible to a `B=1, Sq==Sk` test no matter how tight its tolerance:
+deriving the K/V batch stride from `nhead_q` (unobservable at `B=1`, where the
+batch offset is zero) and deriving the K/V head stride from `Sq` (unobservable
+when `Sq == Sk`, and which otherwise still reports per-head cos_sim 0.999997 and
+LSE error 1.9e-06 — indistinguishable from a correct build). Both are covered by
+shapes chosen for that reason; keep `B > 1` and `Sq != Sk` cases when editing.
