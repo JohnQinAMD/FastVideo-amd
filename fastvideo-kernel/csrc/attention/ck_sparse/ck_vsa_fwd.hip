@@ -62,22 +62,24 @@ __global__ void vbs_lse_correction_kernel(
 
     if (pad_count == 0) return;  // all blocks full, no correction needed
 
-    // Apply correction.
+    // Correct via the padded *fraction* of the denominator rather than the
+    // denominator itself. exp2f(lse) overflows to inf once lse > 128, which real
+    // activations reach, and inf/inf then poisons the output with NaN. Working
+    // with pad_count * exp2(-lse) instead underflows harmlessly to 0, which is
+    // the right answer: padding is negligible next to that large a denominator.
     float lse_val = lse_ptr[tid];
-    float denom_ck = exp2f(lse_val);
-    float denom_correct = denom_ck - static_cast<float>(pad_count);
+    float pad_frac = static_cast<float>(pad_count) * exp2f(-lse_val);
 
-    // Guard: if denom_correct <= 0, all valid positions had -inf scores.
-    if (denom_correct <= 0.0f) {
+    // Also catches NaN, and pad_frac >= 1 means every valid position was -inf.
+    if (!(pad_frac < 1.0f)) {
         lse_ptr[tid] = -1e30f;
-        // Zero out the output for this token.
         float* o_row = o_ptr + static_cast<int64_t>(tid) * D;
         for (int d = 0; d < D; ++d) o_row[d] = 0.0f;
         return;
     }
 
-    float scale = denom_ck / denom_correct;
-    lse_ptr[tid] = log2f(denom_correct);
+    float scale = 1.0f / (1.0f - pad_frac);
+    lse_ptr[tid] = lse_val + log2f(1.0f - pad_frac);
 
     // Scale output in-place.
     float* o_row = o_ptr + static_cast<int64_t>(tid) * D;
@@ -114,17 +116,18 @@ __global__ void vbs_output_correction_kernel(
     }
     if (pad_count == 0) return;
 
+    // See vbs_lse_correction_kernel: exp2f(lse) overflows to inf past lse > 128,
+    // so scale from the padded fraction instead of from the denominator.
     float lse_val = lse_ck_ptr[tid];
-    float denom_ck = exp2f(lse_val);
-    float denom_correct = denom_ck - static_cast<float>(pad_count);
+    float pad_frac = static_cast<float>(pad_count) * exp2f(-lse_val);
 
-    if (denom_correct <= 0.0f) {
+    if (!(pad_frac < 1.0f)) {
         T* o_row = o_ptr + static_cast<int64_t>(tid) * D;
         for (int d = 0; d < D; ++d) o_row[d] = static_cast<T>(0.0f);
         return;
     }
 
-    float scale = denom_ck / denom_correct;
+    float scale = 1.0f / (1.0f - pad_frac);
     T* o_row = o_ptr + static_cast<int64_t>(tid) * D;
     for (int d = 0; d < D; ++d) {
         o_row[d] = static_cast<T>(static_cast<float>(o_row[d]) * scale);

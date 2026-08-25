@@ -375,7 +375,7 @@ def block_sparse_attn(
     Unified block-sparse attention op with autograd support.
     - On SM90 with compiled extension present: uses fastvideo_kernel_ops.block_sparse_fwd/bwd.
     - On AMD gfx950 with CK extension present: uses ck_block_sparse_attn_fwd
-      (HD bk0=64 tile + density dispatch + auto-uniform skip).
+      (kN0=64 tile, auto-skip of the variable-block correction on uniform masks).
     - Otherwise: uses Triton implementation (requires q/k/v to have same padded length today).
 
     Override env vars (in priority order):
