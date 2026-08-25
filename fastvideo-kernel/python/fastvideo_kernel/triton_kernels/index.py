@@ -61,49 +61,6 @@ def map_to_index_kernel(
         q * index_num_q_stride, num)
 
 
-@triton.jit
-def map_to_index_and_delta_kernel(
-    map_ptr,
-    index_ptr,
-    delta_ptr,
-    index_num_ptr,
-    map_bs_stride,
-    map_h_stride,
-    map_q_stride,
-    map_kv_stride,
-    index_bs_stride,
-    index_h_stride,
-    index_q_stride,
-    index_kv_stride,
-    index_num_bs_stride,
-    index_num_h_stride,
-    index_num_q_stride,
-    num_kv_blocks,
-):
-    # Emits both the absolute index LUT (consumed by the VBS correction
-    # kernel) and the delta-encoded LUT (consumed by the CK VSA pipeline)
-    # in a single pass, replacing a dedicated HIP abs→delta launch
-    # downstream.
-    b, h, q = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    index_ptr_base = index_ptr + b * index_bs_stride + h * index_h_stride + q * index_q_stride
-    delta_ptr_base = delta_ptr + b * index_bs_stride + h * index_h_stride + q * index_q_stride
-    map_ptr_base   = map_ptr + b * map_bs_stride + h * map_h_stride + q * map_q_stride
-
-    num = 0
-    prev = 0
-    for i in tl.range(num_kv_blocks):
-        map_entry = tl.load(map_ptr_base + i * map_kv_stride)
-        if map_entry:
-            tl.store(index_ptr_base + num * index_kv_stride, i)
-            tl.store(delta_ptr_base + num * index_kv_stride, i - prev)
-            prev = i
-            num += 1
-
-    tl.store(
-        index_num_ptr + b * index_num_bs_stride + h * index_num_h_stride +
-        q * index_num_q_stride, num)
-
-
 def topk_index_to_map(index: torch.Tensor,
                       num_kv_blocks: int,
                       transpose_map: bool = False):
@@ -196,28 +153,3 @@ def map_to_index(block_map: torch.Tensor):
     )
 
     return index, index_num
-
-
-def map_to_index_and_delta(block_map: torch.Tensor):
-    """Produce (absolute_index, delta_index, index_num) in a single triton launch.
-
-    The delta LUT is what the CK VSA pipeline consumes, so producing it
-    here eliminates the separate HIP abs→delta kernel in the C++ wrapper.
-    Absolute indices are still needed by the variable-block-size
-    correction kernel.
-    """
-    bs, h, num_q_blocks, num_kv_blocks = block_map.shape
-
-    index = torch.full(block_map.shape, -1, dtype=torch.int32, device=block_map.device)
-    delta = torch.zeros(block_map.shape, dtype=torch.int32, device=block_map.device)
-    index_num = torch.empty((bs, h, num_q_blocks), dtype=torch.int32, device=block_map.device)
-
-    grid = (bs, h, num_q_blocks)
-    map_to_index_and_delta_kernel[grid](
-        block_map, index, delta, index_num,
-        block_map.stride(0), block_map.stride(1), block_map.stride(2), block_map.stride(3),
-        index.stride(0), index.stride(1), index.stride(2), index.stride(3),
-        index_num.stride(0), index_num.stride(1), index_num.stride(2),
-        num_kv_blocks=num_kv_blocks,
-    )
-    return index, delta, index_num

@@ -19,32 +19,6 @@
 #include "fmha_fwd_trek.hpp"
 
 // ---------------------------------------------------------------------------
-// HIP kernel: convert absolute block indices -> delta-encoded LUT.
-// ---------------------------------------------------------------------------
-__global__ void abs_to_delta_kernel(
-    const int32_t* __restrict__ abs_idx,
-    const int32_t* __restrict__ num_blks,
-    int32_t*       __restrict__ delta_out,
-    int max_kv_blks,
-    int total_rows)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= total_rows) return;
-    int n = num_blks[row];
-    const int32_t* src = abs_idx + static_cast<int64_t>(row) * max_kv_blks;
-    int32_t*       dst = delta_out + static_cast<int64_t>(row) * max_kv_blks;
-    int prev = 0;
-    for (int i = 0; i < n; ++i) {
-        int cur = src[i];
-        dst[i] = cur - prev;
-        prev = cur;
-    }
-    for (int i = n; i < max_kv_blks; ++i) {
-        dst[i] = 0;
-    }
-}
-
-// ---------------------------------------------------------------------------
 // HIP kernel: variable block size LSE correction.
 //
 // When variable_block_sizes[kv_blk] < BLOCK (64), the padded K/V positions
@@ -169,9 +143,6 @@ ck_block_sparse_attn_fwd(
     torch::Tensor q2k_num,              // [B, H, Q_blks]               int32 counts
     torch::Tensor variable_block_sizes, // [num_kv_blocks]               int32 (tokens per KV block)
     int block_m,                        // 64 — CK tile selection
-    c10::optional<torch::Tensor> q2k_delta_opt = c10::nullopt,
-                                        // accepted for API back-compat; ignored
-                                        // (CK pipeline consumes absolute indices directly).
     bool skip_vbs_correction = true)    // pass false when any KV block size != 64
 {
     TORCH_CHECK(q.is_cuda(), "q must be CUDA");
@@ -200,10 +171,6 @@ ck_block_sparse_attn_fwd(
 
     hipStream_t stream = nullptr;
 
-    // CK pipeline computes delta inline from absolute indices; pass q2k_index directly.
-    (void)q2k_delta_opt;
-    const torch::Tensor& delta_lut = q2k_index;
-
     // --- Build CK args ---
     const float scale_s = 1.0f / std::sqrt(static_cast<float>(D));
     const bool is_bf16 = (q.scalar_type() == at::kBFloat16);
@@ -219,7 +186,8 @@ ck_block_sparse_attn_fwd(
     args.q_ptr               = q.data_ptr();
     args.k_ptr               = k.data_ptr();
     args.v_ptr               = v.data_ptr();
-    args.lut_ptr             = delta_lut.data_ptr<int32_t>();
+    // The CK pipeline differences the absolute indices inline.
+    args.lut_ptr             = q2k_index.data_ptr<int32_t>();
     args.valid_block_num_ptr = q2k_num.data_ptr<int32_t>();
     args.o_ptr               = o.data_ptr();
     args.lse_ptr             = lse.data_ptr<float>();
@@ -293,6 +261,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("q2k_index"), py::arg("q2k_num"),
           py::arg("variable_block_sizes"),
           py::arg("block_m") = 64,
-          py::arg("q2k_delta") = c10::nullopt,
           py::arg("skip_vbs_correction") = true);
 }

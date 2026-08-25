@@ -78,8 +78,6 @@ _triton_attn = _import_from_file(
     os.path.join(_pkg_dir, "triton_kernels", "block_sparse_attn_triton.py"))
 triton_block_sparse_attn_forward = _triton_attn.triton_block_sparse_attn_forward
 
-map_to_index_and_delta = _triton_index.map_to_index_and_delta
-
 BLOCK = 64
 
 
@@ -228,7 +226,6 @@ def run_three_way_test(B, H, Sq, D, Sk, topk, seed=42, skip_pytorch_ref=False,
     # the common all-full-blocks case).
     o_ck, _ = ck_vsa_ops.ck_block_sparse_attn_fwd(
         q, k, v, q2k_idx, q2k_num, vbs, 64,
-        None,                                     # q2k_delta
         not partial_blocks,                       # skip_vbs_correction
     )
     torch.cuda.synchronize()
@@ -444,12 +441,12 @@ def run_benchmarks() -> List[BenchResult]:
 # ─────────────────── Optimized Pipeline Benchmark ─────────────────────────
 
 def run_opt_benchmarks() -> List[BenchResult]:
-    """Benchmark the optimized CK path: fused delta + skip VBS correction."""
+    """Benchmark the CK path with the VBS correction kernel skipped."""
     from triton.testing import do_bench
 
     print()
     print("=" * 100)
-    print("OPTIMIZED PATH: fused delta LUT + skip VBS correction")
+    print("OPTIMIZED PATH: skip VBS correction")
     print("=" * 100)
     print()
 
@@ -477,25 +474,24 @@ def run_opt_benchmarks() -> List[BenchResult]:
         nkv = Sk // BLOCK
         density = topk / nkv * 100
 
-        # Pre-compute fused delta LUT (done once, outside timed region)
-        q2k_idx_fused, q2k_delta, q2k_num_fused = map_to_index_and_delta(bm)
-
         # Triton baseline
         ms_tri = do_bench(
             lambda: triton_block_sparse_attn_forward(q, k, v, q2k_idx, q2k_num, vbs),
             warmup=5, rep=30)
 
-        # CK baseline (no delta, with VBS correction)
+        # CK with the variable-block-size correction kernel. Passed
+        # explicitly: the C++ default is now skip=true, so relying on it here
+        # would benchmark the same call twice.
         ms_ck_base = do_bench(
             lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
-                q, k, v, q2k_idx, q2k_num, vbs, 64),
+                q, k, v, q2k_idx, q2k_num, vbs, 64, False),
             warmup=5, rep=30)
 
-        # CK optimized (fused delta + skip VBS)
+        # CK with the correction skipped, which is valid here because every
+        # KV block is full.
         ms_ck_opt = do_bench(
             lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
-                q, k, v, q2k_idx_fused, q2k_num_fused, vbs, 64,
-                q2k_delta, True),
+                q, k, v, q2k_idx, q2k_num, vbs, 64, True),
             warmup=5, rep=30)
 
         opt_vs_base = ms_ck_base / ms_ck_opt
@@ -550,11 +546,11 @@ def run_blockm128_benchmarks():
         idx = torch.topk(scores, topk, dim=-1).indices
         bm_128 = torch.zeros(B, H, nq_128, nkv, dtype=torch.bool, device="cuda")
         bm_128.scatter_(-1, idx, True)
-        q2k_idx, q2k_delta, q2k_num = map_to_index_and_delta(bm_128)
+        q2k_idx, q2k_num = _map_to_index(bm_128)
         vbs = torch.full((nkv,), BLOCK_KV, dtype=torch.int32, device="cuda")
 
         o_ck, _ = ck_vsa_ops.ck_block_sparse_attn_fwd(
-            q, k, v, q2k_idx, q2k_num, vbs, 128, q2k_delta, True)
+            q, k, v, q2k_idx, q2k_num, vbs, 128, True)
         torch.cuda.synchronize()
 
         # PyTorch fp32 reference
@@ -615,10 +611,7 @@ def run_blockm128_benchmarks():
         idx_64 = torch.topk(scores_64, topk, dim=-1).indices
         bm_64 = torch.zeros(B, H, nq_64, nkv, dtype=torch.bool, device="cuda")
         bm_64.scatter_(-1, idx_64, True)
-        q2k_idx_64, q2k_delta_64, q2k_num_64 = map_to_index_and_delta(bm_64)
-
-        # Also build old-style index for Triton
-        q2k_idx_64_abs, q2k_num_64_abs = _map_to_index(bm_64)
+        q2k_idx_64, q2k_num_64 = _map_to_index(bm_64)
 
         # --- block_m=128 inputs (same density, 128-token Q blocks) ---
         nq_128 = Sq // 128
@@ -626,26 +619,24 @@ def run_blockm128_benchmarks():
         idx_128 = torch.topk(scores_128, topk, dim=-1).indices
         bm_128 = torch.zeros(B, H, nq_128, nkv, dtype=torch.bool, device="cuda")
         bm_128.scatter_(-1, idx_128, True)
-        q2k_idx_128, q2k_delta_128, q2k_num_128 = map_to_index_and_delta(bm_128)
+        q2k_idx_128, q2k_num_128 = _map_to_index(bm_128)
 
         # Triton baseline (block_m=64 only)
         ms_tri = do_bench(
             lambda: triton_block_sparse_attn_forward(
-                q, k, v, q2k_idx_64_abs, q2k_num_64_abs, vbs),
+                q, k, v, q2k_idx_64, q2k_num_64, vbs),
             warmup=5, rep=30)
 
         # CK block_m=64 optimized
         ms_ck64 = do_bench(
             lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
-                q, k, v, q2k_idx_64, q2k_num_64, vbs, 64,
-                q2k_delta_64, True),
+                q, k, v, q2k_idx_64, q2k_num_64, vbs, 64, True),
             warmup=5, rep=30)
 
         # CK block_m=128 optimized
         ms_ck128 = do_bench(
             lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
-                q, k, v, q2k_idx_128, q2k_num_128, vbs, 128,
-                q2k_delta_128, True),
+                q, k, v, q2k_idx_128, q2k_num_128, vbs, 128, True),
             warmup=5, rep=30)
 
         sp_128v64 = ms_ck64 / ms_ck128
@@ -691,25 +682,23 @@ def run_blockm128_benchmarks():
         idx_64 = torch.topk(scores_64, topk, dim=-1).indices
         bm_64 = torch.zeros(B, H, nq_64, nkv, dtype=torch.bool, device="cuda")
         bm_64.scatter_(-1, idx_64, True)
-        q2k_idx_64, q2k_delta_64, q2k_num_64 = map_to_index_and_delta(bm_64)
+        q2k_idx_64, q2k_num_64 = _map_to_index(bm_64)
 
         # Merge to 128-granularity: union adjacent Q-block rows
         bm_merged = bm_64[:, :, 0::2, :] | bm_64[:, :, 1::2, :]
-        q2k_idx_m, q2k_delta_m, q2k_num_m = map_to_index_and_delta(bm_merged)
+        q2k_idx_m, q2k_num_m = _map_to_index(bm_merged)
         avg_topk_128 = q2k_num_m.float().mean().item()
 
         # CK block_m=64 optimized
         ms_ck64 = do_bench(
             lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
-                q, k, v, q2k_idx_64, q2k_num_64, vbs, 64,
-                q2k_delta_64, True),
+                q, k, v, q2k_idx_64, q2k_num_64, vbs, 64, True),
             warmup=5, rep=30)
 
         # CK block_m=128 (merged pattern)
         ms_ck128 = do_bench(
             lambda: ck_vsa_ops.ck_block_sparse_attn_fwd(
-                q, k, v, q2k_idx_m, q2k_num_m, vbs, 128,
-                q2k_delta_m, True),
+                q, k, v, q2k_idx_m, q2k_num_m, vbs, 128, True),
             warmup=5, rep=30)
 
         sp = ms_ck64 / ms_ck128
