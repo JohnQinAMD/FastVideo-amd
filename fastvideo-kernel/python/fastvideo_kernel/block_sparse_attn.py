@@ -309,10 +309,9 @@ def block_sparse_attn_ck_amd(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """AMD CK VSA forward dispatch arm.
 
-    Routes through the FastVideo CK extension (build_hd HD bk0=64 tile when
-    density >= 30% via density-based dispatch in ck_sparse_attn.py; else
-    stock build/ tile). Block-map → q2k_index/q2k_num conversion uses the
-    same Triton helper as the other arms.
+    Routes through the FastVideo CK extension built by
+    csrc/attention/ck_sparse/build.sh. Block-map → q2k_index/q2k_num
+    conversion uses the same Triton helper as the other arms.
     """
     q = q.contiguous()
     k = k.contiguous()

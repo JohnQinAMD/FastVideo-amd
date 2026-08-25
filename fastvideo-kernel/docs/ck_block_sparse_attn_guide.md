@@ -314,35 +314,35 @@ output, lse = ck_vsa_ops.ck_block_sparse_attn_fwd(
 python3 fastvideo-kernel/benchmarks/strict_test_ck_fwd.py --blockm128
 ```
 
-## The high-density (HD) build
+## Removed: the high-density (HD) build
 
-`csrc/attention/ck_sparse/build_hd.sh` produces a second extension whose
-pipeline is overridden by
-`build_hd/include_override/pipeline/block_fmha_pipeline_qr_ks_vs_async_vsa.hpp`.
-It was written when the stock CK codegen emitted a kK0=32 tile, to
-introduce a wider kK0=64 QK chunk plus a second QK accumulator that lets
-consecutive outer-K steps issue independently.
+An earlier revision shipped a second extension (`build_hd.sh`, plus a
+vendored override of CK's `block_fmha_pipeline_qr_ks_vs_async_vsa.hpp`)
+that the wrapper dispatched to above 30 % density. It has been removed.
+Recorded here so the experiment is not repeated blindly:
 
-**It is disabled by default and should stay that way on gfx950.** Two
-things changed underneath it:
-
-- The kK0=64 tile now ships in the stock CK codegen, so
-  `patch_codegen_hd.py` is a no-op — both builds already compile the
-  same `128x64x64x128x32x128` tile. `build_hd.sh` says as much in its
-  log: *"HD bk0=64 tile already present in upstream codegen"*.
-- What remains is the dual accumulator, and it costs more than it
-  returns. It raises the kernel's VGPR count from 96 to 104, which on
-  gfx950 (512 registers per SIMD) drops occupancy from 5 waves to 4.
-  Since the kernel is memory-latency-bound, losing a wave of latency
-  hiding outweighs the extra instruction-level parallelism: measured
-  1–14 % slower than the stock build across Sq ∈ {8K…64K} and
-  density ∈ {10 %, 30 %, 50 %}. Rebuilding the override with the
-  `s_setprio` hints but *without* the dual accumulator gives 88 VGPRs,
-  5 waves, and stock performance to within noise.
-
-Set `FASTVIDEO_KERNEL_CK_HD_THRESHOLD` to a density in [0, 1] to
-re-enable dispatch to it, e.g. when evaluating on an architecture with
-a larger register file.
+- It existed to introduce a wider kK0=64 QK chunk, which **now ships in
+  the stock CK codegen**. Both builds ended up compiling the same
+  `128x64x64x128x32x128` tile, and its codegen patch had silently
+  become a no-op.
+- Its remaining difference was a second QK accumulator, letting
+  consecutive outer-K steps issue independently. That raises the kernel
+  from 96 to 104 VGPRs; on gfx950 (512 registers per SIMD) occupancy
+  drops from 5 waves to 4. The kernel is memory-latency-bound, so
+  losing a wave of latency hiding outweighed the extra
+  instruction-level parallelism — it measured **1–14 % slower** than
+  the stock build across Sq ∈ {8K…64K} and density ∈ {10 %, 30 %,
+  50 %}. Rebuilding the override with its `s_setprio` hints but
+  *without* the dual accumulator gave 88 VGPRs, 5 waves, and stock
+  performance to within noise, i.e. the scheduling hints were free and
+  the accumulator was the whole cost.
+- Overriding a CK internal header via include-path priority also turned
+  out to be a poor fit for a vendored tree: CK changed the block LUT
+  from delta-encoded to absolute, the override did not follow, and
+  nothing failed to compile — it simply produced cos_sim ≈ 0.3 output
+  until the mismatch was found. A future retry on hardware with a
+  larger register file should be re-derived against the CK revision of
+  the day rather than resurrected from history.
 
 ## Supported Features
 
